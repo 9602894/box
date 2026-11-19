@@ -1,0 +1,293 @@
+/* netflix.css — Win-Box 第三套皮肤：Netflix 风格（★ 2026-09-24 新增）
+   规范来源（联网查证 #141414 底 / #E50914 红 / 白底播放键 / 顶部导航 / hover 放大卡片 / 红色进度条）：
+     · 背景 #141414（纯黑用于沉浸区），表层 #1F1F1F / #2D2D2D，文字 #FFF / #BCBCBC / #808080
+     · 强调色仅用于「品牌与主行动」：logo、CTA、进度条、New 徽标（#E50914，hover #B20710）
+     · 按钮：主行动=白底深字（半径 4px）；次要=rgba(109,109,110,.7) 白字；圆角一律 ≤8px
+     · 布局：**无侧边栏**，顶部导航（logo 左 + 导航项），内容行横向滚动、卡片无边框无底、hover 放大 1.05 + 信息面板
+     · 字体：Netflix Sans（系统无此字体 → Helvetica Neue / Segoe UI 回退），字重不细于 400
+   ★ 全部规则限定在 `[data-theme='netflix']` 下，经典亮/暗主题完全不受影响。 */
+
+:root[data-theme='netflix'] {
+  /* ---- 设计令牌：把经典主题的变量映射到 Netflix 调色板 ---- */
+  --bg0: #000;
+  --bg-glass: #141414;
+  --bg1: #141414;
+  --bg-elev: #1f1f1f;
+  --bg-elev2: #2d2d2d;
+  --border: #2d2d2d;
+  --border-soft: rgba(255, 255, 255, .09);
+  --text: #ffffff;
+  --text-dim: #bcbcbc;
+  --accent: #e50914;
+  --accent-soft: rgba(229, 9, 20, .18);
+  --accent-2: #e50914;
+  --danger: #eb3942;
+  --warn: #d89d31;
+  --radius: 8px;
+  --radius-sm: 4px;
+  --shadow: 0 8px 24px rgba(0, 0, 0, .7);
+  --side-w: 0px;
+  /* Netflix 专属 */
+  --nf-red: #e50914;
+  --nf-red-hover: #b20710;
+  --nf-surface: #1f1f1f;
+  --nf-surface-2: #2d2d2d;
+  --nf-dim: #808080;
+  --nf-green: #46d369;
+  --nf-teal: #54b9c5;
+  --nf-card-w: 176px;
+  /* ★ 2026-09-25：顶部导航实测总高（padding 10+14 + 内容 40）—— Hero 满屏按它扣除；
+     改导航内边距/字号时需同步本值（发现页 Hero 会立刻在下方露白）。 */
+  --nf-nav-h: 64px;
+}
+
+/* ---- 全局：纯黑舞台 + Netflix Sans 回退栈（UI 不抢内容） ---- */
+:root[data-theme='netflix'] body {
+  background: #141414;
+  font-family: "Netflix Sans", "Helvetica Neue", "Segoe UI", "Microsoft YaHei", Roboto, Arial, sans-serif;
+  letter-spacing: .012em;
+}
+:root[data-theme='netflix'] a { color: #fff; }
+:root[data-theme='netflix'] .muted { color: var(--nf-dim); }
+
+/* ---- 布局：顶部导航替代侧边栏 ---- */
+:root[data-theme='netflix'] .app { flex-direction: column; background: #141414; }
+:root[data-theme='netflix'] .sidebar { display: none; }
+:root[data-theme='netflix'] .main { background: #141414; }
+
+/* 标题栏：**并进导航条同一行**（一体化）—— 只保留窗口控制按钮，LOGO 在导航条里 */
+/* ★ 2026-09-24：整条顶栏是可拖拽区，且**两套 TopNav 皮肤共用**（netflix + bilibili）。
+   此前只给 netflix 设了 drag → B 站皮肤整条顶栏拖不动（用户实测：主窗口无法拖拽移动）。
+   交互元素必须 no-drag：导航链接、搜索按钮/换源入口（.srcpick）。标题栏自身的按钮区已在组件内联 no-drag。 */
+.nf-nav { -webkit-app-region: drag; }
+.nf-nav .nf-link, .nf-nav .srcpick { -webkit-app-region: no-drag; }
+.nf-nav .titlebar { height: auto; width: auto; flex: none; background: transparent; border: none; padding: 0; justify-content: flex-end; }
+.nf-nav .tb-title { display: none; }
+.nf-nav .tb-controls { gap: 4px; }
+.nf-nav .tb-btn {
+  width: 36px; height: 28px; padding: 0; margin: 0; border-radius: 4px; color: #b9b9b9;
+  display: inline-flex; align-items: center; justify-content: center; background: transparent;
+}
+.nf-nav .tb-btn:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+.nf-nav .tb-btn.tb-close:hover { background: #e50914; color: #fff; }
+/* 导航项与窗口按钮等高（都 ~28px），整行视觉一致 */
+.nf-nav .nf-link { padding: 6px 10px; border-radius: 4px; }
+.nf-nav .nf-link:hover { background: rgba(255, 255, 255, .1); }
+
+/* 顶部导航：logo 左、导航项横排；滚动前是渐变、贴顶后实底 */
+.nf-nav {
+  display: flex; align-items: center; gap: 20px; flex: none;
+  padding: 10px 26px 14px; z-index: 40;
+  background: linear-gradient(180deg, rgba(20, 20, 20, .98), rgba(20, 20, 20, .72) 60%, transparent);
+}
+/* ★ 2026-09-29 缺陷修复（用户报「Netflix / B 站主题下，历史页与搜索结果页的搜索输入框被挡住无法点击」）：
+   真因 = 层序打平。页面自己的 `.topbar` 也是 `position: relative; z-index: 30`（见 global.css，
+   为修「换源列表被封面遮挡」而设），而 `.nf-nav` 此前同为 30 —— 同为 30 时按 DOM 顺序靠后者胜出，
+   页面在导航之后 ⇒ 页面顶栏稳定压在导航整棵子树之上；搜索面板（.sp-panel，向下展开 520px）
+   的第一行输入框恰好落进页面顶栏的区域 → 看得见却点不到（点击都被页面顶栏接管）。
+   修：导航层提到 40（与 Apple 皮肤工具栏同值，同一先例），整棵子树（含搜索面板）稳定压在页面
+   顶栏之上；页面内的弹层（.srcpick-pop 等）自身被顶栏 30 的层包住，不会反向盖住导航。 */
+.nf-logo { color: var(--nf-red); font-weight: 900; font-size: 21px; letter-spacing: 2.5px; flex: 0 0 auto; }
+.nf-link { color: #e5e5e5; font-size: 14px; font-weight: 500; padding: 2px 0; transition: color var(--dur-quick) var(--ease-standard); }
+.nf-link:hover { color: #fff; }
+.nf-link.active { color: #fff; font-weight: 700; }
+.nf-nav .nf-spacer { flex: 1; }
+
+/* ---- 顶栏（页面内工具栏）：融进黑底；按钮一律**低调小号**（★ 2026-09-24 用户：太大太突兀） ---- */
+:root[data-theme='netflix'] .topbar { background: #141414; border-bottom: none; backdrop-filter: none; min-height: 44px; }
+:root[data-theme='netflix'] .topbar button {
+  background: rgba(255, 255, 255, .07); color: #c9c9c9; padding: 5px 12px; font-size: 12.5px; font-weight: 500;
+  border-radius: 4px;
+}
+:root[data-theme='netflix'] .topbar button:hover { background: rgba(255, 255, 255, .14); color: #fff; }
+/* 顶栏不出现红色 CTA（行动点交给内容区/导航），并隐藏「回到源主页/去导入源」这类冗余入口 */
+:root[data-theme='netflix'] .topbar button.primary { background: rgba(255, 255, 255, .07); color: #c9c9c9; display: none; }
+
+/* ---- 按钮：白底主行动 / 半透明次要 / 红色 CTA ---- */
+:root[data-theme='netflix'] button {
+  background: rgba(109, 109, 110, .7); border: none; color: #fff;
+  border-radius: var(--radius-sm); font-weight: 500; padding: 6px 14px;
+}
+:root[data-theme='netflix'] button:hover { background: rgba(109, 109, 110, .5); color: #fff; box-shadow: none; }
+/* 红色只留给真正的品牌行动（详情页播放键悬停等），普通 primary 不作大红块 */
+:root[data-theme='netflix'] button.primary { background: rgba(255, 255, 255, .14); color: #fff; font-weight: 600; }
+:root[data-theme='netflix'] button.primary:hover { background: rgba(255, 255, 255, .24); box-shadow: none; }
+/* 详情页「▶ 播放选中」= Netflix 的白色播放键 */
+:root[data-theme='netflix'] .nf-play-btn { background: #fff !important; color: #141414 !important; font-weight: 700; }
+:root[data-theme='netflix'] .nf-play-btn:hover { background: rgba(255, 255, 255, .8) !important; }
+:root[data-theme='netflix'] .linkbtn { background: none; color: #fff; }
+:root[data-theme='netflix'] .tag {
+  background: rgba(109, 109, 110, .35); border: 1px solid rgba(255, 255, 255, .12); color: #e5e5e5;
+  border-radius: var(--radius-sm); padding: 4px 12px;
+}
+:root[data-theme='netflix'] .tag:hover { border-color: #fff; color: #fff; }
+:root[data-theme='netflix'] .tag.active { background: #fff; border-color: #fff; color: #141414; font-weight: 700; }
+:root[data-theme='netflix'] input,
+:root[data-theme='netflix'] select,
+:root[data-theme='netflix'] textarea { background: rgba(22, 22, 22, .7); border: 1px solid #5a5a5a; color: #fff; }
+:root[data-theme='netflix'] input:focus, :root[data-theme='netflix'] select:focus { border-color: #fff; box-shadow: none; }
+:root[data-theme='netflix'] ::placeholder { color: var(--nf-dim); }
+
+/* ---- 卡片：无边框无底，hover 放大 + 信息面板（Netflix 的核心交互） ---- */
+:root[data-theme='netflix'] .card {
+  background: none; border: none; box-shadow: none; border-radius: 6px; overflow: hidden;
+}
+:root[data-theme='netflix'] .card-media .card { border: none; }
+:root[data-theme='netflix'] .card-media { transition: transform var(--dur-state) var(--ease-spring), z-index 0s; }
+:root[data-theme='netflix'] .card-media:hover {
+  transform: scale(1.06); z-index: 5;
+}
+:root[data-theme='netflix'] .card-media:hover .card {
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .8); background: var(--nf-surface);
+}
+:root[data-theme='netflix'] .card-media img { border-radius: 6px; }
+:root[data-theme='netflix'] .card-media .meta { padding: 8px 10px; }
+:root[data-theme='netflix'] .card-media .name { font-size: 13.5px; font-weight: 600; color: #fff; }
+:root[data-theme='netflix'] .card-media .remarks { color: var(--nf-green); font-weight: 600; }
+:root[data-theme='netflix'] .card-media .badge {
+  background: var(--nf-red); color: #fff; font-weight: 700; border-radius: 3px; backdrop-filter: none;
+}
+:root[data-theme='netflix'] .no-cover {
+  background: var(--nf-surface-2); color: var(--nf-dim); border-radius: 6px;
+}
+:root[data-theme='netflix'] .grid { gap: 10px 12px; grid-template-columns: repeat(auto-fill, minmax(var(--nf-card-w), 1fr)); }
+
+/* ---- 内容区滚动条（深色细条） ---- */
+:root[data-theme='netflix'] .content { padding: 4px 26px 26px; }
+:root[data-theme='netflix'] ::-webkit-scrollbar { width: 8px; height: 8px; }
+:root[data-theme='netflix'] ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+:root[data-theme='netflix'] ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- 发现页：Hero（横版剧照轮播 + 文字处高斯模糊层）+ 内容行 ---- */
+/* ★ 2026-09-25（用户定稿）：Hero **满屏** —— 高度 = 视口 − 顶部导航（--nf-nav-h），下方不再留空，
+   内容行用滚轮往下滑；剧照保持比例**完整显示**（contain），比例之外的区域用同一张图放大模糊填充
+   （见 HeroBackdrop 的 fit="contain"：`.nf-hero-fill` 模糊铺底 + `.nf-hero-fg` 清晰居中）。 */
+.nf-hero {
+  position: relative; margin: -4px -26px 22px;
+  height: calc(100vh - var(--nf-nav-h)); min-height: 420px;
+  display: flex; align-items: flex-end; overflow: hidden;
+  background: #000;
+}
+.nf-hero-bg {
+  position: absolute; inset: 0; background-size: cover; background-position: center 28%;
+  filter: saturate(1.05);
+  /* ★ 2026-09-24：剧照切换 = 交叉淡入淡出（前一张淡出、后一张淡入同时进行，无中间空帧） */
+  transition: opacity .9s ease;
+  will-change: opacity;
+}
+/* 模糊铺底层（仅 Hero 满屏模式）：同一张图 cover 放大 + 模糊，填满 contain 留出的比例外区域 */
+.nf-hero-fill { filter: blur(32px) saturate(1.15) brightness(.8); transform: scale(1.2); }
+/* 清晰层（仅 Hero 满屏模式）：保持比例完整显示，绝不裁切 */
+.nf-hero-fg {
+  position: absolute; inset: 0;
+  background-size: contain; background-position: center; background-repeat: no-repeat;
+  transition: opacity .9s ease;
+  will-change: opacity;
+}
+.nf-hero::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  /* 下方接内容区 + 底部压暗（文字可读性主要由 .nf-hero-body 的模糊层负责，这里只做过渡） */
+  background: linear-gradient(to top, #141414 0%, rgba(20, 20, 20, .55) 24%, rgba(20, 20, 20, .1) 62%, transparent 100%);
+}
+/* ★ 2026-09-24（用户定稿）：**在有字的位置做高斯模糊处理** —— 文字块自身是一层毛玻璃（backdrop-filter） */
+.nf-hero-body {
+  position: relative; z-index: 2; max-width: 62%;
+  margin: 26px 34px 28px; padding: 20px 24px 22px;
+  background: rgba(20, 20, 20, .38);
+  backdrop-filter: blur(18px) saturate(1.25);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 14px;
+  /* 换片时文字块轻微上浮淡入（与背景交叉淡入淡出同节奏） */
+  animation: nfHeroIn .5s cubic-bezier(.22, .61, .36, 1) both;
+}
+@keyframes nfHeroIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.nf-hero-kicker { display: inline-flex; align-items: center; gap: 8px; color: var(--nf-red); font-weight: 800; font-size: 12px; letter-spacing: 2px; margin-bottom: 8px; }
+.nf-hero-title { margin: 0 0 10px; font-size: 40px; line-height: 1.06; font-weight: 800; letter-spacing: -.01em; text-shadow: 0 2px 18px rgba(0, 0, 0, .6); }
+.nf-hero-meta { color: #d2d2d2; font-size: 13px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.nf-hero-match { color: var(--nf-green); font-weight: 700; }
+.nf-hero-actions { display: flex; gap: 8px; align-items: center; }
+/* ★ 用户反馈「按钮太大太突兀」→ 收敛为小号、低饱和，融进画面 */
+.nf-hero-actions button { padding: 6px 16px; font-size: 13.5px; border-radius: 4px; }
+.nf-hero-actions button:not(.nf-play-btn) { background: rgba(255, 255, 255, .12); }
+.nf-hero-actions button:not(.nf-play-btn):hover { background: rgba(255, 255, 255, .2); }
+.nf-row { margin-bottom: 26px; }
+.nf-row-title { font-size: 20px; font-weight: 700; margin: 0 0 10px; color: #e5e5e5; }
+.nf-row-scroll { display: flex; gap: 8px; overflow-x: auto; padding: 8px 2px 14px; }
+.nf-row-scroll > * { flex: 0 0 var(--nf-card-w); }
+/* ★ 2026-09-29：行项 min-width:0（缺陷修复）—— 超长片名（`.name` 是 nowrap）会经 flex 项
+   `min-width:auto` 把卡片撑宽（实测 176 → 267px），封面随 2:3 撑高，整行被拉到 455px 留白。
+   经典皮肤同行同因，已在 DiscoverPage 内联 minWidth:0 修掉。 */
+:root[data-theme='netflix'] .nf-row-scroll > * { min-width: 0; }
+.nf-hero h3, .nf-row-title { letter-spacing: 0; }
+
+/* ★ 2026-09-24：详情页「相关推荐」横条 —— 悬停**只做轻微上浮**（不做 scale），
+   保证一排封面视觉尺寸完全一致（用户反馈「部分封面特别大」）。 */
+:root[data-theme='netflix'] .rec-row > .card-media:hover { transform: translateY(-2px); }
+
+/* ---- 详情页：**横版剧照轮播**当全宽背景（与首页 Hero 同一套图与交互）+ 渐变，标题巨大化 ---- */
+:root[data-theme='netflix'] .content.nf-detail-wrap { position: relative; }
+.nf-detail-backdrop {
+  position: absolute; left: -26px; right: -26px; top: 0; height: 430px; pointer-events: none;
+  overflow: hidden; background: #000;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .95) 0%, rgba(0, 0, 0, .45) 55%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .95) 0%, rgba(0, 0, 0, .45) 55%, transparent 100%);
+}
+/* 剧照层由 HeroBackdrop 渲染（.nf-hero-bg：绝对定位铺满 + opacity 交叉淡入淡出，见 components/HeroBackdrop.tsx） */
+.nf-detail-backdrop .nf-hero-bg { background-position: center 22%; }
+.nf-detail-backdrop::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, rgba(20, 20, 20, .95) 0%, rgba(20, 20, 20, .6) 55%, rgba(20, 20, 20, .3) 100%); }
+:root[data-theme='netflix'] .content.nf-detail-wrap > * { position: relative; z-index: 1; }
+:root[data-theme='netflix'] .nf-detail-wrap h2 { font-size: 34px; font-weight: 800; letter-spacing: -.01em; }
+:root[data-theme='netflix'] .nf-detail-wrap .ep-list { gap: 8px; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+:root[data-theme='netflix'] .ep {
+  background: rgba(109, 109, 110, .3); border: none; border-radius: 4px; color: #e5e5e5; padding: 9px; font-weight: 500;
+}
+:root[data-theme='netflix'] .ep:hover { background: rgba(109, 109, 110, .55); color: #fff; }
+:root[data-theme='netflix'] .ep.active { background: #fff; color: #141414; font-weight: 700; }
+
+/* ---- 播放器：Netflix 风格（黑色舞台 + 红色进度 + 大号中央播放键 + 底部渐隐控制条） ---- */
+:root[data-theme='netflix'] .vplayer { background: #000; }
+:root[data-theme='netflix'] .vp-controls {
+  background: linear-gradient(to top, rgba(0, 0, 0, .92) 0%, rgba(0, 0, 0, .55) 55%, transparent 100%);
+  padding: 22px 22px 16px;
+}
+:root[data-theme='netflix'] .vp-big {
+  width: 74px; height: 74px; border-radius: 50%;
+  background: rgba(20, 20, 20, .55); border: 2px solid rgba(255, 255, 255, .85); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .18s ease, background .18s ease;
+}
+/* ★ hover 必须保留 translate(-50%,-50%)：少了它 transform 被整体替换，
+   按钮（left/top:50% 定位）会瞬间跳到右下半个身位 —— 用户报「鼠标挪到按钮上按钮会移动」 */
+:root[data-theme='netflix'] .vp-big:hover { transform: translate(-50%, -50%) scale(1.06); background: rgba(229, 9, 20, .85); border-color: transparent; }
+:root[data-theme='netflix'] .vplayer.vui .vp-big { opacity: 1; }
+:root[data-theme='netflix'] .vp-progress { height: 6px; background: rgba(255, 255, 255, .28); border-radius: 3px; }
+:root[data-theme='netflix'] .vp-buffer { background: rgba(255, 255, 255, .42); border-radius: 3px; }
+:root[data-theme='netflix'] .vp-played { background: var(--nf-red); border-radius: 3px; }
+:root[data-theme='netflix'] .vp-thumb { width: 9px; height: 9px; background: var(--nf-red); box-shadow: 0 0 0 2px rgba(229, 9, 20, .35); }
+:root[data-theme='netflix'] .vp-ctl { color: #fff; }
+:root[data-theme='netflix'] .vp-ctl:hover { color: var(--nf-red); }
+:root[data-theme='netflix'] .vp-ctl:disabled { color: #6b6b6b; }
+:root[data-theme='netflix'] .vp-bar { gap: 16px; }
+:root[data-theme='netflix'] .vp-next { background: rgba(20, 20, 20, .9); border-radius: 6px; }
+:root[data-theme='netflix'] .vp-next button { background: var(--nf-red); }
+
+/* Keyboard focus keeps the cinema controls discoverable without changing the hover language. */
+:root[data-theme='netflix'] .nf-link:focus-visible,
+:root[data-theme='netflix'] .srcpick-name:focus-visible,
+:root[data-theme='netflix'] .sp-btn:focus-visible {
+  outline: 2px solid var(--nf-red); outline-offset: 3px;
+}
+
+@media (max-width: 720px) {
+  :root[data-theme='netflix'] .nf-nav { padding: 8px 12px 10px; gap: 8px; }
+  :root[data-theme='netflix'] .nf-link { padding: 5px 6px; font-size: 12px; }
+  :root[data-theme='netflix'] .nf-hero-body { max-width: 86%; margin: 18px 16px 20px; padding: 14px 16px 16px; }
+}
+
+/* 播放器窗口（独立 BrowserWindow）：整窗黑底 */
+:root[data-theme='netflix'] .app.pwin, :root[data-theme='netflix'] .app.pwin .main { background: #000; }
+:root[data-theme='netflix'] .app.pwin .titlebar { background: #000; }

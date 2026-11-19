@@ -1,0 +1,491 @@
+// src/renderer/api/client.ts — window.api 的类型化封装 + IpcResult 解包
+import type { IpcResult } from '../../shared/ipc-result';
+import type {
+  SiteConfig,
+  ImportReport,
+  SourceBean,
+  VodItem,
+  VodDetail,
+  PlayResult,
+  LiveGroup,
+  LiveBean,
+  EpgChannelRef,
+  LiveEpgResult,
+  UserConfig,
+  SourceMoveDirection,
+  SourceUpdatePatch,
+  SearchAllReport,
+  SearchAllProgressEvent,
+  SourceDebugReport,
+  UserProfile,
+  ProfileSitesView,
+  DataDirInfo,
+  AuditItem,
+  FilterGroup,
+  BossKeySettings,
+} from '../../shared/types';
+import type {
+  SubtitleCandidate,
+  SubtitleFetchResult,
+  SubtitleProviderView,
+  SubtitleSearchReport,
+  SubtitleSettings,
+} from '../../shared/subtitle';
+import type { DanmakuAnime, DanmakuCandidate, DanmakuSettings } from '../../shared/danmaku';
+import type { MetaHit, MetaExtra, DiscoverSection, DiscoverGenre, DiscoverGenrePage, MetaImages, MovieHotList } from '../../shared/types';
+import type { MetaSettings, MetaSettingsView, MetaSuggestion } from '../../shared/meta';
+import type { PlayerSettings, MpvStatus, MpvStartOptions, MpvCommand, MpvStateEvent } from '../../shared/player';
+import type { BackupExportResult, BackupImportResult } from '../../shared/backup';
+import type { DavBrowseResult, DavServer } from '../../shared/webdav';
+import type { DlnaCastResult, DlnaCastTarget, DlnaDevice } from '../../shared/dlna';
+import type { UpdateCheckResult, UpdateProgress } from '../../shared/update';
+
+interface HomeResult {
+  sortClasses: { id: string; name: string; flag?: string; filters?: FilterGroup[] }[];
+  items: VodItem[];
+  page: number;
+  pagecount: number;
+  total: number;
+  sourceKey: string;
+  /** true = 首页无推荐列表，已自动回退（homeVideoContent 或首个分类）取到内容 */
+  homeFallback?: boolean;
+}
+
+interface ImportReturn {
+  config: SiteConfig;
+  report: ImportReport;
+  warnings: string[];
+  urls?: { name: string; url: string }[];
+}
+
+declare global {
+  interface Window {
+    api: {
+      system: { ping: () => Promise<IpcResult<string>>; icon: () => Promise<IpcResult<string>>; setTheme: (t: string) => Promise<IpcResult<void>>; quit: () => Promise<IpcResult<void>>; dataDir: () => Promise<IpcResult<DataDirInfo>>; sessionId: () => Promise<IpcResult<string>> };
+      config: {
+        import: (a: { url?: string; json?: string }) => Promise<IpcResult<ImportReturn>>;
+        listSites: () => Promise<IpcResult<SourceBean[]>>;
+        diagnose: () => Promise<IpcResult<ImportReport | null>>;
+        cfgGet: () => Promise<IpcResult<UserConfig>>;
+        addSource: (bean: SourceBean) => Promise<IpcResult<SourceBean>>;
+        updateSource: (key: string, patch: SourceUpdatePatch) => Promise<IpcResult<SourceBean>>;
+        deleteSource: (key: string) => Promise<IpcResult<void>>;
+        moveSource: (key: string, direction: SourceMoveDirection) => Promise<IpcResult<void>>;
+        setActiveSource: (key: string) => Promise<IpcResult<void>>;
+        setActiveLive: (index: number) => Promise<IpcResult<void>>;
+        importUrl: (url: string, name?: string) => Promise<IpcResult<ImportReturn>>;
+        // ★ 2026-09-27：本地 .json 订阅文件导入（文件选择器；档案名默认取原始文件名）
+        importJsonLocal: (name?: string) =>
+          Promise<IpcResult<{ ok: boolean; file?: string; name?: string; error?: string; result?: ImportReturn }>>;
+        importPyLocal: () => Promise<IpcResult<{ ok: boolean; key?: string; error?: string }>>;
+        // ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → 写入 imports/py/net-<sha1>/ → 加入源）
+        importPyUrl: (url: string) => Promise<IpcResult<{ ok: boolean; key?: string; error?: string }>>;
+        /** ★ 2026-09-30（用户要求）：导入本地 TXT / M3U 直播源 */
+        importLiveLocal: () =>
+          Promise<IpcResult<{ ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string }>>;
+        /** ★ 2026-09-29：导入本地包（目录包：影视.json + py/js/jar/html/xbpq） */
+        importPackage: (name?: string) =>
+          Promise<IpcResult<{ ok: boolean; root?: string; rel?: string; sites?: number; name?: string; error?: string; warnings?: string[]; result?: ImportReturn }>>;
+        /** ★ 2026-09-29 本地包「网页源」：独立窗口打开 homePage html（fm 桥） */
+        webHomeOpen: (init: { url: string; title?: string; site?: Record<string, string | undefined> }) =>
+          Promise<IpcResult<{ ok: boolean; error?: string }>>;
+        saveAsProfile: (name: string) => Promise<IpcResult<UserProfile>>;
+        activateProfile: (id: string) => Promise<IpcResult<void>>;
+        deleteProfile: (id: string) => Promise<IpcResult<void>>;
+        updateProfileName: (a: { id: string; name: string }) => Promise<IpcResult<void>>;
+        cfgProfiles: () => Promise<IpcResult<Omit<UserProfile, 'json'>[]>>;
+        /** ★ 2026-09-30（用户要求）：换源弹层「左订阅 / 右源」视图 */
+        profileSites: () => Promise<IpcResult<ProfileSitesView>>;
+        /** ★ 2026-09-30（用户要求）：一步完成「切换档案 + 选中该档案下的源」 */
+        switchProfileSource: (a: { profileId: string; key: string }) => Promise<IpcResult<void>>;
+        vodDebug: (key: string) => Promise<IpcResult<SourceDebugReport>>;
+        audit: () => Promise<IpcResult<AuditItem[]>>;
+        cacheClear: () => Promise<IpcResult<{ freedBytes: number; cleared: string[]; failed: string[] }>>;
+        driveBindKeys: () => Promise<IpcResult<string[]>>;
+        gotoDriveBind: () => Promise<IpcResult<void>>;
+        onNavDriveBind: (cb: () => void) => () => void;
+      };
+      // ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮）
+      adKeywords: {
+        get: () => Promise<IpcResult<{ strong: string[]; weak: string[] }>>;
+        set: (patch: Partial<{ strong: string[]; weak: string[] }>) => Promise<IpcResult<{ strong: string[]; weak: string[] }>>;
+      };
+      vod: {
+        home: (key: string) => Promise<IpcResult<HomeResult>>;
+        category: (a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) => Promise<IpcResult<HomeResult>>;
+        detail: (a: { key: string; ids: string[] }) => Promise<IpcResult<VodDetail | null>>;
+        search: (a: { key: string; wd: string }) => Promise<IpcResult<VodItem[]>>;
+        /** ★ 全源搜索：refresh=true 忽略本地缓存强制重搜（「重新搜索」按钮）；默认命中缓存即秒回 */
+        searchAll: (wd: string, opts?: { refresh?: boolean }) => Promise<IpcResult<SearchAllReport>>;
+        /** ★ 聚合搜索逐源进度（边搜边出）：返回退订函数 */
+        onSearchAllProgress: (cb: (ev: SearchAllProgressEvent) => void) => () => void;
+        play: (a: { key: string; flag: string; id: string }) => Promise<IpcResult<PlayResult>>;
+        /** ★ 2026-09-30（用户要求）：点播外部播放器（与磁力分开绑定）——探测本机播放器 / 用当前地址拉起 */
+        detectPlayers: () => Promise<IpcResult<Array<{ id: string; name: string; path: string }>>>;
+        openExternal: (a: { url: string; path?: string; seek?: number }) => Promise<IpcResult<{ ok: boolean; player?: string; error?: string }>>;
+      };
+      live: {
+        /**
+         * ★ 2026-11-13（用户要求）：opts.forceRefresh —— 订阅源更新后绕过 SpiderHost 的
+         *   5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。旧调用 `load(index)` 兼容。
+         */
+        load: (index: number, opts?: { forceRefresh?: boolean }) => Promise<IpcResult<{ groups: LiveGroup[]; liveName: string }>>;
+        meta: () => Promise<IpcResult<LiveBean[]>>;
+        /** ★ 2026-09-29 EPG：传入该线路的频道引用，返回各键（tvg-id/tvg-name/频道名）的「当前 / 下一档」 */
+        epg: (index: number, channels: EpgChannelRef[]) => Promise<IpcResult<LiveEpgResult>>;
+        /** ★ EPG 直查：某频道完整节目单（返回 EpgProgram[]，Date 序列化后为 ISO 字符串） */
+        epgPrograms: (channelName: string | string[]) => Promise<IpcResult<unknown[]>>;
+        /** ★ EPG 直查：某频道当前节目 */
+        epgCurrent: (channelName: string) => Promise<IpcResult<unknown>>;
+        /** ★ EPG 直查：某频道下一档 */
+        epgNext: (channelName: string) => Promise<IpcResult<unknown>>;
+        /** ★ EPG 直查：某频道台标 URL */
+        epgIcon: (channelName: string) => Promise<IpcResult<string>>;
+        /** ★ EPG 手动刷新 */
+        epgRefresh: () => Promise<IpcResult<void>>;
+      };
+      /** ★ 2026-09-29 设置备份（含渲染层 localStorage） */
+      backup: {
+        export: (renderer: Record<string, string>) => Promise<IpcResult<BackupExportResult>>;
+        import: () => Promise<IpcResult<BackupImportResult>>;
+      };
+      /** ★ 2026-09-29 WebDAV 存储（只读） */
+      dav: {
+        list: () => Promise<IpcResult<DavServer[]>>;
+        set: (s: DavServer) => Promise<IpcResult<DavServer>>;
+        remove: (id: string) => Promise<IpcResult<void>>;
+        browse: (a: { id: string; path?: string }) => Promise<IpcResult<DavBrowseResult>>;
+        openExternal: (url: string) => Promise<IpcResult<{ ok: boolean; player?: string; error?: string }>>;
+      };
+      /** ★ 2026-09-29 DLNA 投屏（SSDP 发现 + AVTransport 三动作） */
+      dlna: {
+        discover: () => Promise<IpcResult<DlnaDevice[]>>;
+        cast: (a: { device: DlnaDevice; target: DlnaCastTarget }) => Promise<IpcResult<DlnaCastResult>>;
+      };
+      subtitle: {
+        get: () => Promise<IpcResult<SubtitleSettings>>;
+        set: (patch: Partial<SubtitleSettings>) => Promise<IpcResult<SubtitleSettings>>;
+        /** ★ 2026-09-28：各字幕源的开关/可用状态 */
+        providers: () => Promise<IpcResult<SubtitleProviderView[]>>;
+        /** ★ 2026-09-28：多源聚合检索（返回 { candidates, providers }） */
+        search: (name: string) => Promise<IpcResult<SubtitleSearchReport>>;
+        fetch: (cand: SubtitleCandidate) => Promise<IpcResult<SubtitleFetchResult>>;
+      };
+      danmaku: {
+        get: () => Promise<IpcResult<DanmakuSettings>>;
+        set: (patch: Partial<DanmakuSettings>) => Promise<IpcResult<DanmakuSettings>>;
+        search: (name: string, season?: number) => Promise<IpcResult<DanmakuAnime[]>>;
+        episodes: (bangumiId: number, animeTitle: string | undefined, source: string) => Promise<IpcResult<DanmakuCandidate[]>>;
+        fetch: (episodeId: number, source: string) => Promise<IpcResult<string>>;
+      };
+      meta: {
+        search: (name: string, year?: string, provider?: 'tmdb' | 'douban') => Promise<IpcResult<MetaHit | null>>;
+        /** ★ 详情页增强：演职员/类型/相关推荐 */
+        extra: (name: string, year?: string) => Promise<IpcResult<MetaExtra | null>>;
+        /** ★ 发现页榜单（无源默认主页） */
+        discover: (refresh?: boolean) => Promise<IpcResult<DiscoverSection[]>>;
+        movieHot: () => Promise<IpcResult<MovieHotList>>;
+        discoverImages: (name: string, mediaType: 'movie' | 'tv', year?: string, kind?: 'backdrop' | 'poster') => Promise<IpcResult<MetaImages>>;
+        /** ★ 发现页「分类」：类型清单与按类型翻页 */
+        genres: () => Promise<IpcResult<{ movie: DiscoverGenre[]; tv: DiscoverGenre[] }>>;
+        genrePage: (mediaType: 'movie' | 'tv', genreId: number, page: number) => Promise<IpcResult<DiscoverGenrePage>>;
+        /** ★ 2026-09-24 元数据来源配置（TMDB Key/代理/镜像 + 策略）与搜索联想 */
+        getSettings: () => Promise<IpcResult<MetaSettingsView>>;
+        setSettings: (patch: Partial<MetaSettings>) => Promise<IpcResult<MetaSettingsView>>;
+        suggest: (q: string) => Promise<IpcResult<MetaSuggestion[]>>;
+        /** ★ 发现页 Hero 轮播：某部片的横版剧照 / 竖版海报 */
+        images: (mediaType: 'movie' | 'tv', tmdbId: number) => Promise<IpcResult<MetaImages>>;
+      };
+      drives: {
+        get: () => Promise<IpcResult<Record<string, string>>>;
+        set: (a: { provider: string; token: string }) => Promise<IpcResult<void>>;
+        remove: (provider: string) => Promise<IpcResult<void>>;
+        // ★ 2026-09-30：imageDataUrl = 图片型二维码（百度 passport 直接出图，见 main/net/qr/types.ts）
+        qrCreate: (provider?: string) => Promise<IpcResult<{ provider: string; content: string; imageDataUrl?: string; sid: string }>>;
+        qrPoll: (
+          provider: string,
+          sid: string,
+        ) => Promise<
+          IpcResult<{ state: number; token?: string; tokenKind?: 'refresh_token' | 'cookie' | 'access_token'; username?: string; hint?: string }>
+        >;
+        webLogin: (provider: string) => Promise<IpcResult<void>>;
+      };
+      win: {
+        minimize: () => Promise<IpcResult<void>>;
+        maximize: () => Promise<IpcResult<void>>;
+        close: () => Promise<IpcResult<void>>;
+        isMaximized: () => Promise<IpcResult<boolean>>;
+        // ★ 2026-09-30（用户要求）：播放器置顶按钮
+        setAlwaysOnTop: (on: boolean) => Promise<IpcResult<boolean>>;
+        isAlwaysOnTop: () => Promise<IpcResult<boolean>>;
+        // ★ 2026-10-08（用户要求）：详情页独立窗口（已开则复用并通知换路由）
+        openDetail: (a: { key: string; id: string; query?: string }) => Promise<IpcResult<{ ok: boolean; reused: boolean }>>;
+        openSearch: (term: string) => Promise<IpcResult<{ ok: boolean; reused: boolean }>>;
+        routeReady: () => Promise<IpcResult<void>>;
+        reportError: (message: string) => Promise<IpcResult<void>>;
+        onNavigate: (cb: (route: string) => void) => () => void;
+      };
+      net: {
+        onSpeed: (cb: (kbs: number) => void) => () => void;
+        proxyGet: () => Promise<IpcResult<{ enabled: boolean; url: string }>>;
+        proxySet: (patch: { enabled?: boolean; url?: string }) => Promise<IpcResult<{ enabled: boolean; url: string }>>;
+      };
+      player: {
+        open: (init: unknown) => Promise<IpcResult<void>>;
+        switchEp: (request: number | import('../../shared/playerEpisode').PlayerEpisodeSwitch) => Promise<IpcResult<{ switched: boolean }>>;
+        /** ★ 2026-09-30：订阅就绪 → 主进程重发最新 init（新窗口首推与订阅的竞态） */
+        ready: () => Promise<IpcResult<{ ok: boolean }>>;
+        isOpen: () => Promise<IpcResult<{ open: boolean }>>;
+        close: () => Promise<IpcResult<void>>;
+        setMini: (isMini: boolean) => Promise<IpcResult<{ mini: boolean }>>;
+        isMini: () => Promise<IpcResult<{ mini: boolean }>>;
+        setFullscreen: (fullscreen: boolean) => Promise<IpcResult<{ fullscreen: boolean }>>;
+        isFullscreen: () => Promise<IpcResult<{ fullscreen: boolean }>>;
+        setResizable: (resizable: boolean) => Promise<IpcResult<{ resizable: boolean }>>;
+        onInit: (cb: (init: unknown) => void) => () => void;
+        onSwitchEp: (cb: (epIndex: number) => void) => () => void;
+        onMini: (cb: (mini: boolean) => void) => () => void;
+        onFullscreen: (cb: (fullscreen: boolean) => void) => () => void;
+      };
+      boss: {
+        get: () => Promise<IpcResult<BossKeySettings>>;
+        set: (patch: Partial<BossKeySettings>) => Promise<IpcResult<{ settings: BossKeySettings; registered: boolean }>>;
+        onEnter: (cb: () => void) => () => void;
+        onExit: (cb: () => void) => () => void;
+      };
+      merge: {
+        export: (ids: string[]) => Promise<IpcResult<{ content: string; summary: { name: string; kept: number; duplicated: number; total: number; error?: string }[] }>>;
+        save: (a: { content: string; defaultName?: string }) => Promise<IpcResult<{ saved: boolean; path: string }>>;
+      };
+      quark: {
+        cleanup: () => Promise<IpcResult<void>>;
+      };
+      // ★ 播放偏好（m3u8 去广告开关；改后本地中继 /play 即时生效）
+      playerPrefs: {
+        get: () => Promise<IpcResult<PlayerSettings>>;
+        set: (patch: Partial<PlayerSettings>) => Promise<IpcResult<PlayerSettings>>;
+      };
+      // ★ 2026-10-08 MPV 高兼容播放内核（独立播放器窗口内嵌；状态经 MPV_STATE 事件推送）
+      mpv: {
+        status: () => Promise<IpcResult<MpvStatus>>;
+        start: (opts: MpvStartOptions) => Promise<IpcResult<{ session: number; path: string }>>;
+        cmd: (cmd: MpvCommand) => Promise<IpcResult<{ ok: boolean }>>;
+        stop: () => Promise<IpcResult<{ ok: boolean }>>;
+        onState: (cb: (s: MpvStateEvent) => void) => () => void;
+      };
+      // ★ 2026-09-29 磁力（BT）：本机已安装的外部播放器（MKV/HEVC 接力；只探测不启动）
+      bt: {
+        detectPlayers: () => Promise<IpcResult<Array<{ id: string; name: string; path: string }>>>;
+      };
+      /** ★ 2026-09-29 启动强制更新 */
+      update: {
+        check: () => Promise<IpcResult<UpdateCheckResult>>;
+        download: () => Promise<IpcResult<{ ok: boolean; path?: string; error?: string }>>;
+        install: () => Promise<IpcResult<{ ok: boolean; path: string }>>;
+        onProgress: (cb: (p: UpdateProgress) => void) => () => void;
+      };
+    };
+  }
+}
+
+async function unwrap<T>(p: Promise<IpcResult<T>>): Promise<T> {
+  const r = await p;
+  if (!r.ok) throw new Error(r.error.message);
+  return r.data as T;
+}
+
+export const client = {
+  ping: () => unwrap(window.api.system.ping()),
+  appIcon: () => unwrap(window.api.system.icon()),
+  setTheme: (t: string) => unwrap(window.api.system.setTheme(t)),
+  importConfig: (a: { url?: string; json?: string }) => unwrap(window.api.config.import(a)),
+  listSites: () => unwrap(window.api.config.listSites()),
+  diagnose: () => unwrap(window.api.config.diagnose()),
+  cfgGet: () => unwrap(window.api.config.cfgGet()),
+  cfgAddSource: (bean: SourceBean) => unwrap(window.api.config.addSource(bean)),
+  cfgUpdateSource: (key: string, patch: SourceUpdatePatch) => unwrap(window.api.config.updateSource(key, patch)),
+  cfgDeleteSource: (key: string) => unwrap(window.api.config.deleteSource(key)),
+  cfgMoveSource: (key: string, direction: SourceMoveDirection) => unwrap(window.api.config.moveSource(key, direction)),
+  cfgSetActiveSource: (key: string) => unwrap(window.api.config.setActiveSource(key)),
+  cfgSetActiveLive: (index: number) => unwrap(window.api.config.setActiveLive(index)),
+  cfgImportUrl: (url: string, name?: string) => unwrap(window.api.config.importUrl(url, name)),
+  cfgImportJsonLocal: (name?: string) => unwrap(window.api.config.importJsonLocal(name)),
+  cfgImportPyLocal: () => unwrap(window.api.config.importPyLocal()),
+  /** ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → imports/py/net-<sha1>/ → 加入源） */
+  cfgImportPyUrl: (url: string) => unwrap(window.api.config.importPyUrl(url)),
+  /** ★ 2026-09-29：导入本地包（目录包）—— 返回包根/命中订阅/源数，用于结果提示 */
+  cfgImportPackage: (name?: string) => unwrap(window.api.config.importPackage(name)),
+  /** ★ 2026-09-29 本地包「网页源」：独立窗口打开 homePage html（fm 桥） */
+  webHomeOpen: (init: { url: string; title?: string; site?: Record<string, string | undefined> }) =>
+    unwrap(window.api.config.webHomeOpen(init)),
+  cfgSaveAsProfile: (name: string) => unwrap(window.api.config.saveAsProfile(name)),
+  cfgActivateProfile: (id: string) => unwrap(window.api.config.activateProfile(id)),
+  cfgDeleteProfile: (id: string) => unwrap(window.api.config.deleteProfile(id)),
+  cfgUpdateProfileName: (a: { id: string; name: string }) => unwrap(window.api.config.updateProfileName(a)),
+  cfgProfiles: () => unwrap(window.api.config.cfgProfiles()),
+  /** ★ 2026-09-30（用户要求）：换源弹层「左订阅 / 右源」视图（每份档案的源 key/name 清单） */
+  cfgProfileSites: () => unwrap(window.api.config.profileSites()),
+  /** ★ 2026-09-30（用户要求）：一步完成「切换档案 + 选中该档案下的源」 */
+  cfgSwitchProfileSource: (profileId: string, key: string) =>
+    unwrap(window.api.config.switchProfileSource({ profileId, key })),
+  /** ★ 2026-09-30（用户要求）：导入本地 TXT / M3U 直播源（配置页按钮） */
+  cfgImportLiveLocal: () => unwrap(window.api.config.importLiveLocal()),
+  /** ★ 2026-09-30：数据目录信息（安装目录/data；迁移结果与回退原因） */
+  dataDir: () => unwrap(window.api.system.dataDir()),
+  vodDebug: (key: string) => unwrap(window.api.config.vodDebug(key)),
+  audit: () => unwrap(window.api.config.audit()),
+  cacheClear: () => unwrap(window.api.config.cacheClear()),
+  /** ★ 2026-09-27：已学到的「需要网盘绑定」源 key（源主页显示绑定入口的兜底判据） */
+  driveBindKeys: () => unwrap(window.api.config.driveBindKeys()),
+  // ★ 播放网盘资源未绑定 cookie → 让主窗口跳到「点播页」（源主页有「网盘绑定」入口；播放器窗口也走此路径）
+  gotoDriveBind: () => unwrap(window.api.config.gotoDriveBind()),
+  onNavDriveBind: (cb: () => void) => window.api.config.onNavDriveBind(cb),
+  /** ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮） */
+  adKeywordsGet: () => unwrap(window.api.adKeywords.get()),
+  adKeywordsSet: (patch: Partial<{ strong: string[]; weak: string[] }>) => unwrap(window.api.adKeywords.set(patch)),
+  winMinimize: () => unwrap(window.api.win.minimize()),
+  winMaximize: () => unwrap(window.api.win.maximize()),
+  winClose: () => unwrap(window.api.win.close()),
+  winIsMaximized: () => unwrap(window.api.win.isMaximized()),
+  // ★ 2026-09-30（用户要求）：播放器「置顶」按钮
+  winSetAlwaysOnTop: (on: boolean) => unwrap(window.api.win.setAlwaysOnTop(on)),
+  winIsAlwaysOnTop: () => unwrap(window.api.win.isAlwaysOnTop()),
+  // ★ 2026-10-08（用户要求）：详情页独立窗口
+  winOpenDetail: (a: { key: string; id: string; query?: string }) => unwrap(window.api.win.openDetail(a)),
+  winOpenSearch: (term: string) => unwrap(window.api.win.openSearch(term)),
+  winRouteReady: () => unwrap(window.api.win.routeReady()),
+  winReportError: (message: string) => unwrap(window.api.win.reportError(message)),
+  winOnNavigate: (cb: (route: string) => void) => window.api.win.onNavigate(cb),
+  appQuit: () => unwrap(window.api.system.quit()),
+  /** ★ 2026-09-30：本次主进程启动的会话标识（渲染层判定「新一次启动」→ 丢页面状态类记忆） */
+  systemSessionId: () => unwrap(window.api.system.sessionId()),
+  playerOpen: (init: unknown) => unwrap(window.api.player.open(init)),
+  playerSwitchEp: async (request: number | import('../../shared/playerEpisode').PlayerEpisodeSwitch) =>
+    (await unwrap(window.api.player.switchEp(request))).switched,
+  /** ★ 2026-09-30：播放器窗口订阅就绪 → 重发最新 init（修新窗口「等待播放…」竞态） */
+  playerReady: () => unwrap(window.api.player.ready()),
+  playerIsOpen: () => unwrap(window.api.player.isOpen()),
+  playerClose: () => unwrap(window.api.player.close()),
+  playerOnInit: (cb: (init: unknown) => void) => window.api.player.onInit(cb),
+  playerOnSwitchEp: (cb: (epIndex: number) => void) => window.api.player.onSwitchEp(cb),
+  playerSetMini: (isMini: boolean) => unwrap(window.api.player.setMini(isMini)),
+  playerIsMini: () => unwrap(window.api.player.isMini()),
+  playerSetFullscreen: (fullscreen: boolean) => unwrap(window.api.player.setFullscreen(fullscreen)),
+  playerIsFullscreen: () => unwrap(window.api.player.isFullscreen()),
+  playerSetResizable: (resizable: boolean) => unwrap(window.api.player.setResizable(resizable)),
+  playerOnMini: (cb: (mini: boolean) => void) => window.api.player.onMini(cb),
+  playerOnFullscreen: (cb: (fullscreen: boolean) => void) => window.api.player.onFullscreen(cb),
+  bossGet: () => unwrap(window.api.boss.get()),
+  bossSet: (patch: Partial<BossKeySettings>) => unwrap(window.api.boss.set(patch)),
+  bossOnEnter: (cb: () => void) => window.api.boss.onEnter(cb),
+  bossOnExit: (cb: () => void) => window.api.boss.onExit(cb),
+  mergeExport: (ids: string[]) => unwrap(window.api.merge.export(ids)),
+  mergeSave: (a: { content: string; defaultName?: string }) => unwrap(window.api.merge.save(a)),
+  // 夸克落盘文件清理（播放页/播放器页卸载、窗口关闭时触发）
+  quarkCleanup: () => unwrap(window.api.quark.cleanup()),
+  // ★ 播放偏好（m3u8 去广告开关；配置页读写，本地中继 /play 即时生效）
+  playerPrefsGet: () => unwrap(window.api.playerPrefs.get()),
+  playerPrefsSet: (patch: Partial<PlayerSettings>) => unwrap(window.api.playerPrefs.set(patch)),
+  driveGet: () => unwrap(window.api.drives.get()),
+  driveSet: (provider: string, token: string) => unwrap(window.api.drives.set({ provider, token })),
+  driveRemove: (provider: string) => unwrap(window.api.drives.remove(provider)),
+  driveQrCreate: (provider?: string) => unwrap(window.api.drives.qrCreate(provider)),
+  driveQrPoll: (provider: string, sid: string) => unwrap(window.api.drives.qrPoll(provider, sid)),
+  driveWebLogin: (provider: string) => unwrap(window.api.drives.webLogin(provider)),
+  home: (key: string) => unwrap(window.api.vod.home(key)),
+  category: (a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) => unwrap(window.api.vod.category(a)),
+  detail: (a: { key: string; ids: string[] }) => unwrap(window.api.vod.detail(a)),
+  search: (a: { key: string; wd: string }) => unwrap(window.api.vod.search(a)),
+  searchAll: (wd: string, opts?: { refresh?: boolean }) => unwrap(window.api.vod.searchAll(wd, opts)),
+  onSearchAllProgress: (cb: (ev: SearchAllProgressEvent) => void) => window.api.vod.onSearchAllProgress(cb as (ev: unknown) => void),
+  play: (a: { key: string; flag: string; id: string }) => unwrap(window.api.vod.play(a)),
+  /**
+   * ★ 2026-11-13（用户要求）：opts.forceRefresh —— 订阅源更新后绕过 SpiderHost 的 5 分钟
+   *   内存缓存，拿到真实新 groups + 新 EPG URL。旧调用 `loadLive(index)` 兼容。
+   */
+  loadLive: (index: number, opts?: { forceRefresh?: boolean }) => unwrap(window.api.live.load(index, opts)),
+  liveMeta: () => unwrap(window.api.live.meta()),
+  liveEpg: (index: number, channels: EpgChannelRef[]) => unwrap(window.api.live.epg(index, channels)),
+  /** ★ EPG 直查：支持单 key 或多 key 数组（推荐传 `[tvg-id, tvg-name, name]` 依次尝试） */
+  epgPrograms: (channelNames: string | string[]) => unwrap(window.api.live.epgPrograms(channelNames)),
+  /** ★ EPG 直查：某频道当前节目 */
+  epgCurrent: (channelName: string) => unwrap(window.api.live.epgCurrent(channelName)),
+  /** ★ EPG 直查：某频道下一档 */
+  epgNext: (channelName: string) => unwrap(window.api.live.epgNext(channelName)),
+  /** ★ EPG 直查：某频道台标 URL */
+  epgIcon: (channelName: string) => unwrap(window.api.live.epgIcon(channelName)),
+  /** ★ EPG 手动刷新 */
+  epgRefresh: () => unwrap(window.api.live.epgRefresh()),
+  /** ★ 2026-09-29 设置备份 */
+  backupExport: (renderer: Record<string, string>) => unwrap(window.api.backup.export(renderer)),
+  backupImport: () => unwrap(window.api.backup.import()),
+  /** ★ 2026-09-29 WebDAV 存储（只读） */
+  davList: () => unwrap(window.api.dav.list()),
+  davSet: (s: DavServer) => unwrap(window.api.dav.set(s)),
+  davRemove: (id: string) => unwrap(window.api.dav.remove(id)),
+  davBrowse: (a: { id: string; path?: string }) => unwrap(window.api.dav.browse(a)),
+  davOpenExternal: (url: string) => unwrap(window.api.dav.openExternal(url)),
+  /** ★ 2026-09-29 DLNA 投屏 */
+  dlnaDiscover: () => unwrap(window.api.dlna.discover()),
+  dlnaCast: (a: { device: DlnaDevice; target: DlnaCastTarget }) => unwrap(window.api.dlna.cast(a)),
+  subtitleGet: () => unwrap(window.api.subtitle.get()),
+  subtitleSet: (patch: Partial<SubtitleSettings>) => unwrap(window.api.subtitle.set(patch)),
+  /** ★ 2026-09-28：各字幕源的开关/可用状态（配置页渲染） */
+  subtitleProviders: () =>
+    unwrap(window.api.subtitle.providers()) as Promise<SubtitleProviderView[]>,
+  /** ★ 2026-09-28：多源聚合检索 → { candidates, providers }（providers 说明逐源状态，用于空结果提示） */
+  subtitleSearch: (name: string) =>
+    unwrap(window.api.subtitle.search(name)) as Promise<SubtitleSearchReport>,
+  /** ★ 2026-09-24：返回 { text, fileName, format, entries, reason } —— 用真实字幕文件名判定格式 */
+  subtitleFetch: (cand: SubtitleCandidate) =>
+    unwrap(window.api.subtitle.fetch(cand)) as Promise<SubtitleFetchResult>,
+  danmakuGet: () => unwrap(window.api.danmaku.get()),
+  danmakuSet: (patch: Partial<DanmakuSettings>) => unwrap(window.api.danmaku.set(patch)),
+  danmakuSearch: (name: string, season?: number) => unwrap(window.api.danmaku.search(name, season)),
+  danmakuEpisodes: (bangumiId: number, animeTitle: string | undefined, source: string) =>
+    unwrap(window.api.danmaku.episodes(bangumiId, animeTitle, source)),
+  danmakuFetch: (episodeId: number, source: string) => unwrap(window.api.danmaku.fetch(episodeId, source)),
+  // TMDB 元数据补全（缺封面/缺简介兜底，凭据内置密文）
+  metaSearch: (name: string, year?: string, provider?: 'tmdb' | 'douban') => unwrap(window.api.meta.search(name, year, provider)),
+  /** ★ 详情页增强：演职员/类型/相关推荐 */
+  metaExtra: (name: string, year?: string) => unwrap(window.api.meta.extra(name, year)),
+  /** ★ 发现页榜单（无源默认主页；refresh 绕过 6h 缓存） */
+  metaDiscover: (refresh?: boolean) => unwrap(window.api.meta.discover(refresh)),
+  metaMovieHot: () => unwrap(window.api.meta.movieHot()),
+  metaDiscoverImages: (name: string, mediaType: 'movie' | 'tv', year?: string, kind?: 'backdrop' | 'poster') => unwrap(window.api.meta.discoverImages(name, mediaType, year, kind)),
+  /** ★ 发现页「分类」：TMDB 类型清单 */
+  metaGenres: () => unwrap(window.api.meta.genres()),
+  /** ★ 发现页「分类」：按类型取一页 */
+  metaGenrePage: (mediaType: 'movie' | 'tv', genreId: number, page: number) => unwrap(window.api.meta.genrePage(mediaType, genreId, page)),
+  /** ★ 2026-09-24：元数据来源配置（读取返回能力布尔 + 用户自填值，**绝不含内置密文**） */
+  metaGetSettings: () => unwrap(window.api.meta.getSettings()),
+  metaSetSettings: (patch: Partial<MetaSettings>) => unwrap(window.api.meta.setSettings(patch)),
+  /** ★ 搜索面板联想（TMDB / 豆瓣，随来源策略） */
+  metaSuggest: (q: string) => unwrap(window.api.meta.suggest(q)),
+  /** ★ 发现页 Hero 轮播：横版剧照（≤6）/ 竖版海报（≤8），已包装 /img 中继 */
+  metaImages: (mediaType: 'movie' | 'tv', tmdbId: number) => unwrap(window.api.meta.images(mediaType, tmdbId)),
+  netSpeed: (cb: (kbs: number) => void) => window.api.net.onSpeed(cb),
+  /** ★ 2026-10-08 MPV 高兼容播放内核：探活/路径、启停、控制命令、状态事件（仅独立播放器窗口用） */
+  mpvStatus: () => unwrap<MpvStatus>(window.api.mpv.status()),
+  mpvStart: (opts: MpvStartOptions) => unwrap<{ session: number; path: string }>(window.api.mpv.start(opts)),
+  mpvCmd: (cmd: MpvCommand) => unwrap<{ ok: boolean }>(window.api.mpv.cmd(cmd)),
+  mpvStop: () => unwrap<{ ok: boolean }>(window.api.mpv.stop()),
+  mpvOnState: (cb: (s: MpvStateEvent) => void) => window.api.mpv.onState(cb as (s: unknown) => void),
+  /** ★ 2026-09-29 磁力（BT）：探测本机外部播放器（MKV/HEVC 接力；配置页可指定路径） */
+  btDetectPlayers: () => unwrap(window.api.bt.detectPlayers()),
+  /** ★ 2026-09-30（用户要求）：点播外部播放器（与磁力分开绑定）——探测本机播放器 / 用当前地址拉起 */
+  vodDetectPlayers: () => unwrap(window.api.vod.detectPlayers()),
+  /** `seek`（秒）：显式绑定外部播放器时，从历史续播的位置（按播放器类型拼起播参数） */
+  vodOpenExternal: (url: string, path?: string, seek?: number) => unwrap(window.api.vod.openExternal({ url, path, seek })),
+  /** ★ 2026-09-29 启动强制更新：检查 / 下载 / 拉起安装程序（进度走 onUpdateProgress） */
+  updateCheck: () => unwrap(window.api.update.check()),
+  updateDownload: () => unwrap(window.api.update.download()),
+  updateInstall: () => unwrap(window.api.update.install()),
+  onUpdateProgress: (cb: (p: UpdateProgress) => void) => window.api.update.onProgress(cb),
+  /** ★ 网络代理设置（DNS 污染 / SNI 阻断站点用） */
+  proxyGet: () => unwrap<{ enabled: boolean; url: string }>(window.api.net.proxyGet()),
+  proxySet: (patch: { enabled?: boolean; url?: string }) =>
+    unwrap<{ enabled: boolean; url: string }>(window.api.net.proxySet(patch)),
+};
+
+export type { HomeResult, ImportReturn };

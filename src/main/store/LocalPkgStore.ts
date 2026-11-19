@@ -1,0 +1,420 @@
+// src/main/store/LocalPkgStore.ts
+// ★ 2026-09-29（用户要求）：本地包登记表（<userData>/local-pkgs.json）。
+//
+// 为什么需要登记：导入本地包后，订阅里展开出的 `http://127.0.0.1:9978/pkg/<i>/<rel>`
+// 要能被 LocalProxyServer 反查到真实目录；且重启后仍要有效（磁盘持久化）。
+// Imports are copied to the application's imports directory; originals are never deleted.
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import type { UserConfig } from '../../shared/types';
+import type { JsonStore } from './JsonStore';
+import {
+  findPkgSubscription,
+  normalizePkgRoot,
+  pkgRootKey,
+  registerPkg,
+  resolvePkgFile,
+  rewritePkgPaths,
+  type LocalPkgEntry,
+} from '../../engine/config/localPkg';
+
+export const LOCAL_PKG_KEY = 'pkgs';
+const LOCAL_PY_KEY = 'owned-python';
+
+/** Includes inactive subscriptions, so shared imports survive deleting one source. */
+function references(config: UserConfig): string[] {
+  const out: string[] = [];
+  const visit = (value: unknown): void => {
+    if (typeof value === 'string') {
+      out.push(value);
+      if (/^\s*[\[{]/.test(value)) {
+        try { visit(JSON.parse(value)); } catch { /* non-JSON extension */ }
+      }
+    } else if (Array.isArray(value)) value.forEach(visit);
+    else if (value && typeof value === 'object') Object.values(value).forEach(visit);
+  };
+  visit(config);
+  return out;
+}
+
+function localFile(value: string): string | null {
+  if (!/^file:\/\//i.test(value)) return null;
+  try {
+    const url = new URL(value);
+    url.search = ''; url.hash = '';
+    return fileURLToPath(url);
+  } catch { return null; }
+}
+
+function inside(root: string, file: string): boolean {
+  const rel = relative(resolve(root), resolve(file));
+  return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/** SpiderHost 侧的最小依赖面（结构类型，便于单测注入假实现） */
+export interface LocalPkgAccess {
+  /** 包根（/pkg 路由与 py 就地运行用）；未登记返回 null */
+  rootOf(index: number): string | null;
+  /** 读包内订阅文本（已展开相对路径）；未登记/文件缺失返回 null */
+  readSubscription(index: number, rel: string): { text: string; warnings: string[] } | null;
+  migrateConfig?(config: UserConfig, warn?: (message: string) => void): UserConfig;
+  cleanupRemoved?(before: UserConfig, after: UserConfig): void;
+}
+
+export class LocalPkgStore implements LocalPkgAccess {
+  constructor(
+    private store: JsonStore,
+    /** 本地代理基址（`http://127.0.0.1:9978`） */
+    private proxyBase: string,
+    private importsDir = join(dirname(store.filePath), 'imports'),
+  ) {}
+
+  list(): LocalPkgEntry[] {
+    const raw: unknown = this.store.getObject<unknown>(LOCAL_PKG_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((e) => (e && typeof e === 'object' ? (e as Partial<LocalPkgEntry>) : null))
+      // Tombstones keep /pkg/<index> stable after a package is deleted.
+      .map((e) => ({ ...e, root: normalizePkgRoot(e?.root || ''), name: e?.name || basename(e?.root || ''), addedAt: e?.addedAt || '' }));
+  }
+
+  /** 登记（幂等）→ 返回包下标 */
+  register(root: string): number {
+    const { list, index } = registerPkg(this.list(), root);
+    this.store.setObject(LOCAL_PKG_KEY, list);
+    return index;
+  }
+
+  rootOf(index: number): string | null {
+    const e = this.list()[index];
+    return e?.root || null;
+  }
+
+  private save(entries: LocalPkgEntry[]): void {
+    this.store.setObject(LOCAL_PKG_KEY, entries);
+    this.store.flush();
+  }
+
+  /** Copy the entire package, preserving Python imports and all sibling resources. */
+  importSubscription(root: string): ReturnType<LocalPkgStore['locateSubscription']> {
+    const source = resolve(root);
+    const files = readdirSync(source, { withFileTypes: true }).filter(d => d.isFile()).map(d => d.name);
+    if (!findPkgSubscription(files, name => readFileSync(join(source, name), 'utf-8'))) return null;
+    const target = join(this.importsDir, 'packages', randomUUID());
+    this.copyPackage(source, target);
+    try {
+      const found = this.locateSubscription(target);
+      if (!found) throw new Error('复制后的本地包没有可用订阅');
+      const entries = this.list();
+      entries[found.index] = { ...entries[found.index], name: basename(source), managed: true, sourceRoot: source };
+      this.save(entries);
+      return found;
+    } catch (e) {
+      rmSync(target, { recursive: true, force: true });
+      throw e;
+    }
+  }
+
+  private copyPackage(source: string, target: string): void {
+    // Refuse recursive self-imports and symlinks/junctions into outside folders.
+    if (resolve(source) === resolve(this.importsDir) || inside(source, this.importsDir)) {
+      throw new Error('请选择独立的本地包目录，不要选择安装目录或 imports 的上级目录');
+    }
+    mkdirSync(dirname(target), { recursive: true });
+    try {
+      cpSync(source, target, { recursive: true, filter: path => {
+        if (lstatSync(path).isSymbolicLink()) throw new Error('本地包包含符号链接，请先将链接内容复制为普通文件');
+        return true;
+      } });
+    } catch (e) {
+      rmSync(target, { recursive: true, force: true });
+      throw e;
+    }
+  }
+
+  /**
+   * ★ 2026-11-15（用户要求）：本地 .py 导入 —— 目录名改用 .py 文件名词干（默认 `local-<stem>`），
+   * 不再用 randomUUID() 生成"序列号"目录；与 SpiderHost.importPyFromUrl（`net-<stem>`）/
+   * healUserConfig（`local-<stem>`）保持一致。仍记录到 LOCAL_PY_KEY，保证删源时能清理磁盘文件。
+   * @param source 本地 .py 绝对路径
+   * @param key    可选目录名（IPC 层传 `local-<文件名>`，与源 key 对齐）；不传则默认 `local-<stem>`
+   */
+  importPython(source: string, key?: string): string {
+    const content = readFileSync(source);
+    if (!content.length) throw new Error('所选 .py 文件为空');
+    const base = basename(source) || 'source.py';
+    const stem = base.replace(/\.py$/i, '').replace(/[\\/:*?"<>|]/g, '_') || 'source';
+
+    // 目录名校验：不允许空 / . / .. / 含路径分隔符，避免越界写入
+    const rawDir = (key || `local-${stem}`).trim();
+    if (!rawDir || rawDir === '.' || rawDir === '..' || /[\\/]/.test(rawDir)) {
+      throw new Error(`非法源目录名：${rawDir || '(空)'}`);
+    }
+    const dirName = rawDir.replace(/[:*?"<>|]/g, '_') || `local-${stem}`;
+    const targetDir = join(this.importsDir, 'py', dirName);
+    if (!inside(this.importsDir, targetDir)) {
+      throw new Error(`目标目录越界：${targetDir}`);
+    }
+    const target = join(targetDir, base);
+
+    // ★ 同名同内容：直接返回已有路径（避免重复写 + 避免重复登记 owned）
+    if (existsSync(target)) {
+      try {
+        if (readFileSync(target).equals(content)) {
+          const owned = this.store.getObject<string[]>(LOCAL_PY_KEY, []);
+          if (!owned.includes(target)) {
+            this.store.setObject(LOCAL_PY_KEY, [...owned, target]);
+            this.store.flush();
+          }
+          return pathToFileURL(target).href;
+        }
+      } catch { /* 读失败按正常流程覆盖 */ }
+    }
+
+    // 同名不同内容（或首次导入）：先清旧目录，避免旧文件残留
+    if (existsSync(targetDir)) rmSync(targetDir, { recursive: true, force: true });
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(target, content);
+
+    const owned = this.store.getObject<string[]>(LOCAL_PY_KEY, []);
+    const next = owned.includes(target) ? owned : [...owned, target];
+    this.store.setObject(LOCAL_PY_KEY, next);
+    this.store.flush();
+    return pathToFileURL(target).href;
+  }
+
+  private owned(file: string): boolean {
+    if (!inside(this.importsDir, file)) return false;
+    // The lexical check alone is insufficient if an owned folder is replaced
+    // with a junction. Check its physical location before any deletion.
+    try {
+      let existing = file;
+      while (!existsSync(existing)) {
+        const parent = dirname(existing);
+        if (parent === existing) return false;
+        existing = parent;
+      }
+      return inside(realpathSync(this.importsDir), realpathSync(existing));
+    }
+    catch { return false; }
+  }
+
+  cleanupRemoved(before: UserConfig, after: UserConfig): void {
+    const oldRefs = references(before);
+    const refs = references(after);
+    const files = new Set(refs.map(localFile).filter((f): f is string => !!f).map(pkgRootKey));
+    const entries = this.list();
+    const python = this.store.getObject<string[]>(LOCAL_PY_KEY, []);
+    for (const value of oldRefs) {
+      const file = localFile(value);
+      if (!file || files.has(pkgRootKey(file)) || !this.owned(file)) continue;
+      const isPython = /\.py$/i.test(file);
+      const registered = python.some(p => pkgRootKey(p) === pkgRootKey(file)) || entries.some(e => e.managed && e.root && inside(e.root, file));
+      if (isPython && registered) rmSync(file, { force: true });
+    }
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      if (!entry.managed || !entry.root || !this.owned(entry.root)) continue;
+      const referencesEntry = (value: string) => value.startsWith(`pkg://${index}/`) ||
+        value.includes(`${this.proxyBase.replace(/\/$/, '')}/pkg/${index}/`) ||
+        (() => { const file = localFile(value); return !!file && inside(entry.root, file); })();
+      if (oldRefs.some(referencesEntry) && !refs.some(referencesEntry)) {
+        rmSync(entry.root, { recursive: true, force: true });
+        entries[index] = { ...entry, root: '' };
+      }
+    }
+    const retained = python.filter(file => {
+      if (files.has(pkgRootKey(file)) || !oldRefs.some(value => {
+        const old = localFile(value);
+        return old && pkgRootKey(old) === pkgRootKey(file);
+      }) || !this.owned(file)) return true;
+      if (!this.owned(dirname(file))) return true;
+      rmSync(dirname(file), { recursive: true, force: true });
+      return false;
+    });
+    this.store.setObject(LOCAL_PY_KEY, retained);
+    this.save(entries);
+  }
+
+  /** Roll back only this failed import, never another concurrent import. */
+  discardImport(reference: string, config: UserConfig): void {
+    this.cleanupRemoved({ ...config, apiUrl: reference }, config);
+  }
+
+  /**
+   * ★ 2026-11-15（用户要求）：把历史 `imports/py/<UUID>/<file>.py` 迁移到 `imports/py/local-<stem>/<file>.py`。
+   *   - 复制而非移动：旧 UUID 目录保留，历史 profiles 里引用旧路径的源仍可用。
+   *   - 目标已存在且内容不同 → warn 跳过，绝不覆盖。
+   *   - 幂等：`replacements` 里已有映射则跳过；`net-*` / `local-*` 前缀目录直接跳过。
+   *   - 同步更新 LOCAL_PY_KEY，保证删源时 cleanupRemoved 清理的是新目录。
+   */
+  private migratePyDirs(replacements: Array<[string, string]>, warn: (message: string) => void): void {
+    const pyRoot = join(this.importsDir, 'py');
+    if (!existsSync(pyRoot)) return;
+    let dirents: Array<{ name: string; isDirectory: () => boolean }> = [];
+    try { dirents = readdirSync(pyRoot, { withFileTypes: true }); }
+    catch { return; }
+
+    for (const d of dirents) {
+      if (!d.isDirectory()) continue;
+      const dirName = d.name;
+      // 已经是新规则目录（net-/local-）的，跳过
+      if (dirName.startsWith('net-') || dirName.startsWith('local-')) continue;
+
+      const oldDir = join(pyRoot, dirName);
+      let pyFiles: string[] = [];
+      try { pyFiles = readdirSync(oldDir).filter((f) => f.toLowerCase().endsWith('.py')); }
+      catch { continue; }
+      if (!pyFiles.length) continue;
+
+      const pyFile = pyFiles[0];
+      const stem = pyFile.replace(/\.py$/i, '').replace(/[\\/:*?"<>|]/g, '_') || 'source';
+      const newDirName = `local-${stem}`;
+      const newDir = join(pyRoot, newDirName);
+      const oldAbs = join(oldDir, pyFile);
+      const newAbs = join(newDir, pyFile);
+
+      // 幂等：本进程/上次已映射过则跳过
+      if (replacements.some(([from]) => from === pathToFileURL(oldAbs).href)) continue;
+
+      try {
+        if (existsSync(newDir)) {
+          // 目标已存在：内容全部一致才合并，否则 warn 跳过
+          let identical = true;
+          for (const f of pyFiles) {
+            const dest = join(newDir, f);
+            if (existsSync(dest)) {
+              const a = readFileSync(join(oldDir, f));
+              const b = readFileSync(dest);
+              if (!a.equals(b)) { identical = false; break; }
+            }
+          }
+          if (!identical) {
+            warn(`本地 py 迁移跳过（目标 ${newDirName} 已存在同名不同内容的文件，旧目录保留）：${oldDir}`);
+            continue;
+          }
+          for (const f of pyFiles) {
+            const dest = join(newDir, f);
+            if (!existsSync(dest)) writeFileSync(dest, readFileSync(join(oldDir, f)));
+          }
+        } else {
+          mkdirSync(newDir, { recursive: true });
+          for (const f of pyFiles) {
+            writeFileSync(join(newDir, f), readFileSync(join(oldDir, f)));
+          }
+        }
+      } catch (e) {
+        warn(`本地 py 迁移失败（旧目录保留）：${oldDir} — ${String(e)}`);
+        continue;
+      }
+
+      // 更新 LOCAL_PY_KEY：旧路径 → 新路径，并去重
+      const owned = this.store.getObject<string[]>(LOCAL_PY_KEY, []);
+      const oldKey = pkgRootKey(oldAbs);
+      const mapped = owned.map((p) => (pkgRootKey(p) === oldKey ? newAbs : p));
+      const dedup: string[] = [];
+      const seen = new Set<string>();
+      for (const p of mapped) {
+        const k = pkgRootKey(p);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        dedup.push(p);
+      }
+      this.store.setObject(LOCAL_PY_KEY, dedup);
+      this.store.flush();
+
+      replacements.push([pathToFileURL(oldAbs).href, pathToFileURL(newAbs).href]);
+    }
+  }
+
+  /** Upgrade old in-place packages without changing their stable pkg:// index. */
+  migrateConfig(config: UserConfig, warn: (message: string) => void = () => {}): UserConfig {
+    const replacements: Array<[string, string]> = [];
+    const entries = this.list();
+    for (const entry of entries) {
+      if (entry.managed) {
+        // Also repair persisted file URLs if a previous startup copied the
+        // package but exited before the user-config store was flushed.
+        if (entry.root && entry.sourceRoot) replacements.push([
+          pathToFileURL(entry.sourceRoot).href + '/', pathToFileURL(entry.root).href + '/',
+        ]);
+        continue;
+      }
+      if (!entry.root || !existsSync(entry.root)) continue;
+      const source = entry.root;
+      const target = join(this.importsDir, 'packages', randomUUID());
+      try { this.copyPackage(source, target); }
+      catch (e) {
+        warn(`本地包副本迁移失败（原文件保留）：${source} — ${String(e)}`);
+        continue;
+      }
+      replacements.push([pathToFileURL(source).href + '/', pathToFileURL(target).href + '/']);
+      entry.root = target; entry.sourceRoot = source; entry.managed = true;
+      this.save(entries);
+    }
+    // Standalone scripts from the old local-py store already belong to the app;
+    // copy them too, but leave old files intact during migration.
+    const legacy = join(dirname(this.store.filePath), 'local-py');
+    for (const value of references(config)) {
+      const file = localFile(value);
+      if (file && inside(legacy, file) && existsSync(file) && !replacements.some(([from]) => from === pathToFileURL(file).href)) {
+        try { replacements.push([pathToFileURL(file).href, this.importPython(file)]); }
+        catch (e) { warn(`Python 副本迁移失败（原文件保留）：${file} — ${String(e)}`); }
+      }
+    }
+    // ★ 2026-11-15（用户要求）：迁移历史 UUID 命名的 py 目录 → local-<stem>
+    this.migratePyDirs(replacements, warn);
+
+    let json = JSON.stringify(config);
+    for (const [from, to] of replacements) json = json.split(from).join(to);
+    this.save(entries);
+    return JSON.parse(json) as UserConfig;
+  }
+
+  /**
+   * 读包内订阅：读原始文本 → `rewritePkgPaths` 展开相对路径 → 返回新文本。
+   * 包根不存在 / 订阅文件不存在 → null（调用方上屏"重新导入该包"）。
+   */
+  readSubscription(index: number, rel: string): { text: string; warnings: string[] } | null {
+    const root = this.rootOf(index);
+    if (!root || !existsSync(root)) return null;
+    const abs = resolvePkgFile(root, rel);
+    if (!abs || !existsSync(abs)) return null;
+    try {
+      const text = readFileSync(abs, 'utf-8');
+      const out = rewritePkgPaths(text, { index, root, proxyBase: this.proxyBase });
+      return { text: out.text, warnings: out.warnings };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 在包根顶层找订阅 JSON（导入用；**顺带完成登记**，返回的 index 即 `/pkg/<i>/` 的下标）。
+   * @returns index + rel 文件名 + 展开后的文本 + 命中条数 + 相对引用告警；找不到返回 null
+   */
+  locateSubscription(
+    root: string,
+  ): { index: number; rel: string; text: string; warnings: string[]; sites: number } | null {
+    const r = normalizePkgRoot(root);
+    if (!existsSync(r)) return null;
+    let files: string[] = [];
+    try {
+      files = readdirSync(r, { withFileTypes: true })
+        .filter((d) => d.isFile())
+        .map((d) => d.name);
+    } catch {
+      return null;
+    }
+    const found = findPkgSubscription(files, (name) => {
+      const abs = resolvePkgFile(r, name);
+      return abs && existsSync(abs) ? readFileSync(abs, 'utf-8') : '';
+    });
+    if (!found) return null;
+    const index = this.register(r);
+    const out = rewritePkgPaths(found.text, { index, root: r, proxyBase: this.proxyBase });
+    return { index, rel: found.rel, text: out.text, warnings: out.warnings, sites: found.sites };
+  }
+}

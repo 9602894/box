@@ -1,0 +1,524 @@
+name: Build Windows Application
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: '基础版本号（如 1.21.2）。留空则用 package.json 的 version'
+        required: false
+        type: string
+        default: ''
+      action:
+        description: '操作'
+        required: true
+        type: choice
+        options:
+          - build-and-release
+          - delete-only
+        default: 'build-and-release'
+      delete_tag:
+        description: '要删除的 tag（如 v1.21.2-2026-10-14-13-05-30-abc1234）'
+        required: false
+        type: string
+        default: ''
+      draft:
+        description: '发布为草稿'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# ==================================================================
+# 全局镜像加速配置（国内网络环境必需）
+# ==================================================================
+env:
+  GH_PROXY: "https://gh-proxy.com/"
+  # 备选镜像（若主镜像失效可切换）：
+  # GH_PROXY: "https://ghproxy.net/"
+  # GH_PROXY: "https://ghproxy.homeboyc.cn/"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==================================================================
+      # 0a. 可选：删除指定 tag 的 Release
+      # ==================================================================
+      - name: Delete existing release (if requested)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.delete_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.delete_tag }}"
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+            echo "✓ Release 已删除"
+          fi
+          gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" 2>/dev/null \
+            && echo "✓ Tag 已删除" || echo "（无同名 tag）"
+
+      # ==================================================================
+      # 0b. 计算完整版本号
+      # ==================================================================
+      - name: Resolve full version
+        if: github.event.inputs.action != 'delete-only'
+        id: ver
+        shell: pwsh
+        run: |
+          $base = "${{ github.event.inputs.base_version }}".Trim()
+          if (-not $base) {
+            $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+            $base = $pkg.version
+          }
+          $base = $base -replace '^v', ''
+          if ($base -notmatch '^\d+\.\d+\.\d+') { throw "基础版本号格式非法：$base" }
+          $bj = (Get-Date).ToUniversalTime().AddHours(8)
+          $bjStamp = $bj.ToString('yyyy-MM-dd-HH-mm-ss')
+          $sha = "${{ github.sha }}"
+          $shortSha = $sha.Substring(0, 7)
+          $full = "${base}-${bjStamp}-${shortSha}"
+          $tag  = "v$full"
+          "base=$base"              >> $env:GITHUB_OUTPUT
+          "bj_stamp=$bjStamp"       >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha"     >> $env:GITHUB_OUTPUT
+          "full=$full"              >> $env:GITHUB_OUTPUT
+          "tag=$tag"                >> $env:GITHUB_OUTPUT
+          "output_dir=release$full" >> $env:GITHUB_OUTPUT
+
+      - name: Apply version to package.json
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.full }}"
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $pkg.version = $v
+          if ($pkg.build.directories.output) { $pkg.build.directories.output = "release$v" }
+          $pkg | ConvertTo-Json -Depth 32 | Set-Content package.json -Encoding utf8
+
+      - name: Setup Node.js
+        if: github.event.inputs.action != 'delete-only'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        if: github.event.inputs.action != 'delete-only'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install dependencies
+        if: github.event.inputs.action != 'delete-only'
+        run: npm install
+
+      # ==================================================================
+      # 1. 打印本仓库 resources 目录树
+      # ==================================================================
+      - name: Print repository resources tree
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          Write-Host "========== 本仓库 resources/ 完整树 =========="
+          if (Test-Path "resources") {
+            Get-ChildItem "resources" -Recurse -File |
+              Select-Object @{n='Path';e={$_.FullName.Replace($PWD.Path + '\', '')}}, Length |
+              Format-Table -AutoSize
+          } else {
+            throw "本仓库没有 resources 目录"
+          }
+          Write-Host "========== 检查 resources/js-lib =========="
+          if (Test-Path "resources/js-lib") {
+            Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
+          } else {
+            Write-Warning "本仓库 resources/js-lib 目录不存在"
+          }
+
+      # ==================================================================
+      # 2. JRE 21（通过镜像加速下载）
+      # ==================================================================
+      - name: Prepare JRE
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $jreDir = "resources/jvm/jre"
+          if (Test-Path "$jreDir/bin/java.exe") {
+            Write-Host "✓ JRE 已存在"
+            & "$jreDir/bin/java.exe" -version
+            exit 0
+          }
+          Write-Host "⬇  从 Adoptium 下载 JRE 21"
+          New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
+          $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
+          $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600; break }
+            catch { if ($attempts -ge 3) { throw "JRE download failed" }; Start-Sleep -Seconds 5 }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
+          & "$jreDir/bin/java.exe" -version
+
+      # ==================================================================
+      # 3. dex2jar 完整工具链（通过镜像加速下载）
+      #    关键：下载完整 dex-tools 包，包含所有修复工具
+      # ==================================================================
+      - name: Prepare dex2jar
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $d2j = "resources/jvm/d2j"
+          $mainJar = Get-ChildItem $d2j -Filter "dex-tools-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($mainJar) {
+            Write-Host "✓ dex2jar 已存在：$($mainJar.Name)"
+            exit 0
+          }
+          Write-Host "⬇  从 GitHub Releases 下载 dex2jar v2.4（经镜像加速）"
+          $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
+          $rawUrl = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+          $url = "$env:GH_PROXY$rawUrl"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300; break }
+            catch { if ($attempts -ge 3) { throw "dex2jar download failed" }; Start-Sleep -Seconds 5 }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+
+          New-Item -ItemType Directory -Force -Path $d2j | Out-Null
+
+          # ★ 复制所有 jar（包括根目录和 lib 子目录）
+          Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
+          if (Test-Path "$($inner.FullName)/lib") {
+            Get-ChildItem "$($inner.FullName)/lib/*.jar" | Copy-Item -Destination $d2j -Force
+          }
+          # 复制 bat/sh 脚本（Windows 下 bat 是关键）
+          Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
+          Get-ChildItem "$($inner.FullName)/*.sh"  -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
+
+          # ★ 将 dex2jar 的全部运行时依赖复制到 libs/
+          #    这是修复 "DEX 构造器修复工具缺失" 的关键
+          $libs = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $libs | Out-Null
+          $allJars = Get-ChildItem $d2j -Filter "*.jar" -Recurse -File
+          foreach ($jar in $allJars) {
+            Copy-Item $jar.FullName -Destination $libs -Force
+            Write-Host "  → libs/$(Split-Path $jar.FullName -Leaf)"
+          }
+
+          # 验证关键修复工具是否存在
+          $checkJars = @("d2j-dex-recompute-checksum*.jar", "d2j-dex2jar*.jar", "dex-reader*.jar", "dex-ir*.jar")
+          foreach ($pattern in $checkJars) {
+            $found = Get-ChildItem $d2j -Filter $pattern -Recurse -File | Select-Object -First 1
+            if ($found) { Write-Host "  ✓ $($found.Name)" }
+            else { Write-Warning "  ⚠ 未找到 $pattern" }
+          }
+          Write-Host "dex2jar 工具链准备完成"
+
+      # ==================================================================
+      # 4. Maven 依赖（通过镜像加速下载）
+      # ==================================================================
+      - name: Prepare Maven deps
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $libs = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $libs | Out-Null
+          $maven = @(
+            @{ n = "gson-2.10.1.jar";           u = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar" },
+            @{ n = "okhttp-3.14.9.jar";         u = "https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/3.14.9/okhttp-3.14.9.jar" },
+            @{ n = "okio-1.17.5.jar";           u = "https://repo1.maven.org/maven2/com/squareup/okio/okio/1.17.5/okio-1.17.5.jar" },
+            @{ n = "jsoup-1.17.2.jar";          u = "https://repo1.maven.org/maven2/org/jsoup/jsoup/1.17.2/jsoup-1.17.2.jar" },
+            @{ n = "json-20180813.jar";         u = "https://repo1.maven.org/maven2/org/json/json/20180813/json-20180813.jar" },
+            @{ n = "bcprov-jdk18on-1.78.1.jar"; u = "https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar" },
+            @{ n = "slf4j-api-2.0.16.jar";      u = "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar" },
+            @{ n = "slf4j-simple-2.0.16.jar";   u = "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar" },
+            @{ n = "sqlite-jdbc-3.46.1.0.jar";  u = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar" }
+          )
+          foreach ($m in $maven) {
+            $dest = Join-Path $libs $m.n
+            if (Test-Path $dest) { Write-Host "✓ $($m.n)"; continue }
+            Write-Host "⬇  $($m.n)"
+            $attempts = 0
+            while ($attempts -lt 3) {
+              $attempts++
+              try { Invoke-WebRequest -Uri $m.u -OutFile $dest -UseBasicParsing -TimeoutSec 120; break }
+              catch { if ($attempts -ge 3) { throw "download failed: $($m.n)" }; Start-Sleep -Seconds 3 }
+            }
+          }
+
+      # ==================================================================
+      # 5. Patch stubs-src：补两个缺失类
+      # ==================================================================
+      - name: Patch stubs-src
+        if: github.event.inputs.action != 'delete-only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p resources/jvm/stubs-src/android/content
+          mkdir -p resources/jvm/stubs-src/com/github/catvod/net
+
+          cat > resources/jvm/stubs-src/android/content/SharedPreferences.java << 'JAVAEOF'
+          package android.content;
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+          public interface SharedPreferences {
+              Map<String, SharedPreferences> Mem = new ConcurrentHashMap<>();
+              String getString(String key, String defValue);
+              int getInt(String key, int defValue);
+              long getLong(String key, long defValue);
+              boolean getBoolean(String key, boolean defValue);
+              float getFloat(String key, float defValue);
+              Editor edit();
+              interface Editor {
+                  Editor putString(String key, String value);
+                  Editor putInt(String key, int value);
+                  Editor putLong(String key, long value);
+                  Editor putBoolean(String key, boolean value);
+                  Editor putFloat(String key, float value);
+                  boolean commit();
+                  void apply();
+              }
+          }
+          JAVAEOF
+
+          cat > resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java << 'JAVAEOF'
+          package com.github.catvod.net;
+          import okhttp3.Dns;
+          import okhttp3.OkHttpClient;
+          import okhttp3.Request;
+          import okhttp3.Response;
+          import okhttp3.ResponseBody;
+          import java.util.Map;
+          import java.util.concurrent.TimeUnit;
+          public class OkHttp {
+              private static OkHttpClient client;
+              public static Dns dns() { return Dns.SYSTEM; }
+              public static OkHttpClient client() {
+                  if (client == null) {
+                      client = new OkHttpClient.Builder()
+                              .connectTimeout(30, TimeUnit.SECONDS)
+                              .readTimeout(30, TimeUnit.SECONDS)
+                              .writeTimeout(30, TimeUnit.SECONDS)
+                              .build();
+                  }
+                  return client;
+              }
+              public static String string(String url) throws Exception { return string(url, null); }
+              public static String string(String url, Map<String, String> headers) throws Exception {
+                  Request.Builder b = new Request.Builder().url(url);
+                  if (headers != null) {
+                      for (Map.Entry<String, String> e : headers.entrySet()) b.addHeader(e.getKey(), e.getValue());
+                  }
+                  try (Response resp = client().newCall(b.build()).execute()) {
+                      ResponseBody body = resp.body();
+                      return body == null ? "" : body.string();
+                  }
+              }
+          }
+          JAVAEOF
+          echo "patched stubs-src"
+
+      # ==================================================================
+      # 6. 编译 stubs.jar
+      # ==================================================================
+      - name: Compile stubs.jar
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $stubsSrc = "resources/jvm/stubs-src"
+          if (-not (Test-Path $stubsSrc)) {
+            if (Test-Path "resources/jvm/stubs/stubs.jar") {
+              Write-Host "✓ stubs.jar 已存在，跳过编译"
+              exit 0
+            }
+            throw "既没 stubs-src 也没 stubs.jar"
+          }
+
+          $stubsDir = "resources/jvm/stubs"
+          $classes  = Join-Path $stubsDir "classes"
+          New-Item -ItemType Directory -Force -Path $stubsDir | Out-Null
+          Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $classes | Out-Null
+
+          $androidAll = Join-Path $stubsDir "android-all-base.jar"
+          if (-not (Test-Path $androidAll)) {
+            Write-Host "⬇  android-all（编译用，之后删）"
+            $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
+            $attempts = 0
+            while ($attempts -lt 3) {
+              $attempts++
+              try { Invoke-WebRequest -Uri $url -OutFile $androidAll -UseBasicParsing -TimeoutSec 900; break }
+              catch { if ($attempts -ge 3) { throw "android-all download failed" }; Start-Sleep -Seconds 5 }
+            }
+          }
+
+          $sources = @(Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
+          $spiderRunner = "resources/jvm/SpiderRunner.java"
+          if (Test-Path $spiderRunner) {
+            Write-Host "adding SpiderRunner.java"
+            $sources += (Resolve-Path $spiderRunner).Path
+          } else {
+            throw "resources/jvm/SpiderRunner.java 不存在"
+          }
+
+          Write-Host "Compiling $($sources.Count) .java files..."
+          $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          $cp = (@($libs) + @($androidAll)) -join ";"
+          javac -encoding UTF-8 -cp $cp -d $classes $sources
+          if ($LASTEXITCODE -ne 0) { throw "javac failed" }
+
+          $stubsJar = Join-Path $stubsDir "stubs.jar"
+          Copy-Item $androidAll $stubsJar -Force
+          Push-Location $classes
+          & jar uf "../stubs.jar" .
+          Pop-Location
+
+          $jarList = & jar tf $stubsJar
+          $hit = $jarList | Where-Object { $_ -match '^SpiderRunner\.class$' }
+          if (-not $hit) { throw "stubs.jar 中未找到 SpiderRunner.class" }
+
+          Remove-Item -Force $androidAll -ErrorAction SilentlyContinue
+          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
+
+      # ==================================================================
+      # 7. 校验 resources 完整性
+      # ==================================================================
+      - name: Verify resources
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $must = @(
+            "resources/js-lib",
+            "resources/jvm/jre/bin/java.exe",
+            "resources/jvm/stubs/stubs.jar",
+            "resources/jvm/d2j/dex-tools-v2.4.jar",
+            "resources/jvm/libs"
+          )
+          $missing = @()
+          foreach ($m in $must) {
+            if (Test-Path $m) { Write-Host "✓ $m" }
+            else { $missing += $m; Write-Host "❌ $m" }
+          }
+          if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
+
+          # ★ 额外校验：dex2jar 修复工具是否齐全
+          Write-Host "`n=== 校验 dex2jar 修复工具 ==="
+          $d2jChecks = @(
+            "d2j-dex2jar*.jar",
+            "d2j-dex-recompute-checksum*.jar",
+            "d2j-jar2dex*.jar",
+            "dex-reader*.jar",
+            "dex-ir*.jar",
+            "dex-translator*.jar"
+          )
+          $d2jMissing = @()
+          foreach ($pattern in $d2jChecks) {
+            $found = Get-ChildItem "resources/jvm/d2j" -Filter $pattern -Recurse -File | Select-Object -First 1
+            if ($found) { Write-Host "  ✓ $($found.Name)" }
+            else { $d2jMissing += $pattern; Write-Host "  ❌ 未找到 $pattern" }
+          }
+          if ($d2jMissing.Count -gt 0) {
+            Write-Warning "以下 dex2jar 工具缺失，DEX 修复可能失败：$($d2jMissing -join ', ')"
+          }
+
+          Write-Host "`n=== resources/js-lib 内容 ==="
+          Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
+
+          Write-Host "`n=== resources/jvm/libs 内容 ==="
+          Get-ChildItem "resources/jvm/libs" -File | Select-Object Name, Length | Format-Table -AutoSize
+
+      # ==================================================================
+      # 8. 测试 & 构建
+      # ==================================================================
+      - name: Run typecheck
+        if: github.event.inputs.action != 'delete-only'
+        run: npm run typecheck
+
+      - name: Run tests
+        if: github.event.inputs.action != 'delete-only'
+        continue-on-error: true
+        run: npm run test
+
+      - name: Build application
+        if: github.event.inputs.action != 'delete-only'
+        run: npm run build
+
+      - name: Create placeholder LICENSE.txt
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "LICENSE.txt")) {
+            "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
+          }
+
+      - name: Package with electron-builder
+        if: github.event.inputs.action != 'delete-only'
+        run: npx electron-builder --win --publish never
+
+      - name: List release dir
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.ver.outputs.output_dir }}"
+          if (Test-Path $dir) {
+            Get-ChildItem $dir -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
+          } else {
+            throw "release 目录不存在: $dir"
+          }
+
+      - name: Upload build artifacts
+        if: github.event.inputs.action != 'delete-only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-box-installer-${{ steps.ver.outputs.full }}
+          path: |
+            ${{ steps.ver.outputs.output_dir }}/*.exe
+            ${{ steps.ver.outputs.output_dir }}/*.blockmap
+            ${{ steps.ver.outputs.output_dir }}/latest.yml
+
+      - name: Upload to GitHub Release
+        if: github.event_name != 'pull_request' && github.event.inputs.action != 'delete-only'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Win-Box ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
+          body: |
+            ## Win-Box ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
+
+            > 北京时间：`${{ steps.ver.outputs.bj_stamp }}`（UTC+8）
+            > Commit：`${{ github.sha }}`
+            > 回退：`git checkout ${{ github.sha }}`
+
+            ### 下载
+            - `Win-Box Setup ${{ steps.ver.outputs.full }}.exe`
+            - `latest.yml` / `*.blockmap`
+          files: |
+            ${{ steps.ver.outputs.output_dir }}/*.exe
+            ${{ steps.ver.outputs.output_dir }}/*.blockmap
+            ${{ steps.ver.outputs.output_dir }}/latest.yml
+          draft: ${{ github.event.inputs.draft == 'true' }}
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
