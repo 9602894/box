@@ -1,7 +1,4 @@
 // src/main/index.ts — Electron 主进程入口
-// ★★ 第一条 import（import 即执行，勿挪位置）：把数据目录切到**安装目录/data**，
-//   并在老用户首次启动时自动迁移 %APPDATA%\win-box（见 dataDirBootstrap.ts 头注释）。
-//   必须早于 logger / 各 Store 的模块求值，否则它们会把路径解析到旧位置。
 import { dataDirReport } from './util/dataDirBootstrap';
 import { app, BrowserWindow, nativeTheme, shell } from 'electron';
 import { join } from 'node:path';
@@ -14,9 +11,6 @@ import { applyWindowCorner } from './util/windowCorner';
 import { bossKey } from './bossKey';
 import { playerWindow, onPlayerWindowClosed } from './player/PlayerWindow';
 import { playerSettings } from './player/playerSettings';
-// ★ 2026-11-10（用户要求）：广告屏蔽 —— `hostRegexFor` 取订阅规则，`builtinAdRegex` 取软件内置规则；
-//   两者在 proxy 构造里拼接，因此订阅没写规则也能清洗「赌场/娱乐城」等内置关键词。
-//   关键词可由配置页「m3u8 去广告 · 规则」按钮编辑，持久化在 main/player/adKeywordSettings.ts。
 import { hostRegexFor, builtinAdRegex } from '../engine/util/m3u8Purify';
 import { adKeywordSettings } from './player/adKeywordSettings';
 import { TorrentPlay } from './torrent/torrentPlay';
@@ -29,10 +23,7 @@ import { LocalPkgStore } from './store/LocalPkgStore';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
 import { localImportsDir, userDataDir } from './util/paths';
 import { safeStorageDriveCodec } from './util/driveCodec';
-// ★ 2026-11-15（用户要求）：user-config.json 被外部程序误删时自动从备份恢复。
-//   必须在 new SpiderHost() 之前调用，否则 UserConfigManager 已经用空配置初始化。
 import { backupUserConfig, tryRecoverFromBackup } from './util/configBackup';
-// ★ 2026-10-13：订阅源相关（IPC 注册 + 本地导入函数注入 + 启动自动检查更新）
 import {
   registerLiveSubscriptionIpc,
   bindLiveImporter,
@@ -41,98 +32,55 @@ import {
 import { importLiveFileFromPath } from './live/importLiveFile';
 // ★ 2026-11-20：直播 libmpv 服务（electron-mpv-video）
 import { createMpvMain } from 'electron-mpv-video/main';
-// esbuild 打成 CJS：__dirname 由 Node 提供（= dist/）。资源在 dist/../../resources。
 declare const __dirname: string;
 
-// ★ 2026-11-15：先备份当前配置，再尝试从备份恢复（均在 SpiderHost 构造之前）。
-//   顺序不能反：先备份「当前这份」（如果它是有效的）才能保留最新状态；再恢复只在当前缺失/空时才生效。
+// ★ 声明全局变量，后续在 whenReady 里赋值
+let mpvMain: ReturnType<typeof createMpvMain> | null = null;
+
 try {
   const dir = userDataDir();
   backupUserConfig(dir);
   tryRecoverFromBackup(dir);
 } catch {
-  /* 数据目录初始化早期日志可能还没就绪，静默 */
+  /* 静默 */
 }
 
 let mainWindow: BrowserWindow | null = null;
 const host = new SpiderHost();
-// ★ 2026-11-20：直播 libmpv 服务（只 attach 主窗口，点播 playerWindow 不接）
-const mpvMain = createMpvMain();
-/**
- * ★ 2026-09-29：磁力（BT）引擎（用户选定方案 B）—— aria2c sidecar + 本机中继 `/bt` + 外部播放器接力。
- * 懒启动（首次磁力播放才拉起 aria2c），退出时 dispose（另有 `--stop-with-process` 兜底防孤儿）。
- */
+
 const torrent = new TorrentPlay(fileLogger, () => playerSettings.settings.btExternalPlayer);
 host.torrentPlay = torrent;
-/**
- * ★ 2026-09-29 WebDAV 存储（用户选定「WebDAV 直连」）：服务器与凭据加密落盘，
- * 浏览走 PROPFIND、播放走 `/play?dav=<id>` 由中继注入 Authorization（凭据绝不进 URL）。
- */
+
 const dav = new DavService(
   new DavStore(new JsonStore(join(userDataDir(), 'webdav-servers.json')), fileLogger, safeStorageDriveCodec()),
   fileLogger,
 );
-/** ★ 2026-09-29 DLNA 投屏（SSDP 发现 + AVTransport 三动作；对位 CatClaw Dlna.cs = TVBox osc/dlna） */
+
 const dlna = new DlnaService(fileLogger);
-/**
- * ★★ 2026-10-13（用户要求「屏蔽软件的更新功能」）★★
- *   用**哑更新器**替换真实 UpdateService。
- */
+
 const updater = (() => {
   const CURRENT_VERSION = app.getVersion();
   const noopCheck = async () => ({
-    hasUpdate: false,
-    updateAvailable: false,
-    available: false,
-    needUpdate: false,
-    shouldUpdate: false,
-    hasNewVersion: false,
-    forced: false,
-    mandatory: false,
-    forceUpdate: false,
-    current: CURRENT_VERSION,
-    currentVersion: CURRENT_VERSION,
-    localVersion: CURRENT_VERSION,
-    latest: CURRENT_VERSION,
-    latestVersion: CURRENT_VERSION,
-    version: CURRENT_VERSION,
-    tag: CURRENT_VERSION,
-    tagName: CURRENT_VERSION,
-    tag_name: CURRENT_VERSION,
-    version_name: CURRENT_VERSION,
-    remoteVersion: CURRENT_VERSION,
-    downloadUrl: '',
-    url: '',
-    notes: '',
-    releaseNotes: '',
-    body: '',
-    publishedAt: '',
-    name: '',
+    hasUpdate: false, updateAvailable: false, available: false, needUpdate: false,
+    shouldUpdate: false, hasNewVersion: false, forced: false, mandatory: false,
+    forceUpdate: false, current: CURRENT_VERSION, currentVersion: CURRENT_VERSION,
+    localVersion: CURRENT_VERSION, latest: CURRENT_VERSION, latestVersion: CURRENT_VERSION,
+    version: CURRENT_VERSION, tag: CURRENT_VERSION, tagName: CURRENT_VERSION,
+    tag_name: CURRENT_VERSION, version_name: CURRENT_VERSION, remoteVersion: CURRENT_VERSION,
+    downloadUrl: '', url: '', notes: '', releaseNotes: '', body: '', publishedAt: '', name: '',
   });
-
   const noopDownload = async () => ({ ok: false, error: '更新功能已禁用' });
   const noopLaunch = async () => ({ ok: false, error: '更新功能已禁用' });
   const noopDownloadedPath = () => null as string | null;
-
   return {
-    check: noopCheck,
-    download: noopDownload,
-    downloadedPath: noopDownloadedPath,
-    launch: noopLaunch,
+    check: noopCheck, download: noopDownload, downloadedPath: noopDownloadedPath, launch: noopLaunch,
   } as unknown as UpdateService;
 })();
-/**
- * ★ 2026-09-29（用户要求）本地包：登记表 + `/pkg` 资源路由 + py 就地运行。
- */
+
 const localPkgs = new LocalPkgStore(new JsonStore(join(userDataDir(), 'local-pkgs.json')), LOCAL_PROXY_BASE, localImportsDir());
 const proxy = new LocalProxyServer(
   fileLogger,
   () => host.driveList(),
-  // ★ 2026-09-29 m3u8 去广告注入（默认关，配置页「播放」可开）：
-  //   开关每轮清单回源时现读（改后即时生效）；规则 = 当前订阅的 rules[].regex + 软件内置关键词规则。
-  //   ★ 2026-11-10：`builtinAdRegex(strong, weak)` 用用户当前关键词（配置页「规则」按钮可编辑）；
-  //   `adsFor()` 把订阅 `ads` 域名黑名单交给 /play 入口（命中即 204，始终生效，不依赖 m3u8 去广告开关）；
-  //   `strongKeywordsFor()` 把用户强关键词交给 /play 入口的 URL 级拦截。
   {
     enabled: () => playerSettings.settings.m3u8Purify,
     rulesFor: (url) => [
@@ -144,11 +92,11 @@ const proxy = new LocalProxyServer(
   },
   (id) => dav.authHeader(id),
 );
-// ★ 2026-09-29（用户要求）本地包：包内资源路由（/pkg/<i>/<rel>）+ 订阅 pkg:// 读取
+
 proxy.pkgRoot = (i) => localPkgs.rootOf(i);
 host.localPkgs = localPkgs;
 host.initializeLocalImports();
-// ★ 把 /play 中继的真实转发字节速率推给渲染层（播放器「缓存中」实时网速）
+
 const pushSpeed = (kbs: number): void => {
   for (const w of BrowserWindow.getAllWindows()) {
     if (!w.isDestroyed()) w.webContents.send('net:speed', kbs);
@@ -198,8 +146,17 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
-  // ★ 新增：授权主窗口使用 libmpv（直播播放器 <mpv-video> 依赖此授权）
-  mpvMain.attachWindow(mainWindow);
+  // ★ 这里要判断 mpvMain 是否初始化成功，再 attach
+  if (mpvMain) {
+    try {
+      mpvMain.attachWindow(mainWindow);
+      fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务');
+    } catch (e) {
+      fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
+    }
+  } else {
+    fileLogger.w('[libmpv] mpvMain 初始化失败，直播不可用');
+  }
 
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
@@ -209,9 +166,7 @@ function createWindow(): void {
       try {
         const { webContents } = mainWindow;
         if (!webContents.isDestroyed()) webContents.invalidate();
-      } catch {
-        /* ignore */
-      }
+      } catch { /* ignore */ }
     }
   };
   mainWindow.on('maximize', () => { setCorner(false); refreshContent(); });
@@ -235,15 +190,15 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  // ★ 新增：libmpv 运行时路径（开发=resources/libmpv，打包后=resources/libmpv）
-  //   electron-mpv-video 默认查找 %USERPROFILE%\libmpv\bin，这里通过环境变量覆盖，
-  //   保证自包含 exe 能找到随包分发的 libmpv-2.dll。
+  // ======================================================================
+  // 1. ★ 必须先设置 libmpv 运行时路径！
+  // ======================================================================
   try {
     const { resourcesDir } = await import('./util/paths');
     const mpvDir = join(resourcesDir(), 'libmpv');
     if (existsSync(mpvDir)) {
       process.env.MPV_RUNTIME_DIR = mpvDir;
-      fileLogger.i(`[libmpv] 运行时目录: ${mpvDir}`);
+      fileLogger.i(`[libmpv] 运行时目录设置成功: ${mpvDir}`);
     } else {
       fileLogger.w(`[libmpv] 运行时目录不存在: ${mpvDir}，直播将无法播放`);
     }
@@ -251,7 +206,23 @@ app.whenReady().then(async () => {
     fileLogger.w('[libmpv] 路径探测失败: ' + (e as Error).message);
   }
 
-  // ★ 2026-09-30 数据目录（安装目录/data；老用户自动迁移 + 清理旧 C 盘目录）——排障第一现场
+  // ======================================================================
+  // 2. ★ 然后再初始化 MPV 服务
+  // ======================================================================
+  try {
+    mpvMain = createMpvMain();
+    // 如果库支持 whenReady，最好 await 确保底层 DLL 已加载
+    if (typeof (mpvMain as any).whenReady === 'function') {
+      await (mpvMain as any).whenReady();
+      fileLogger.i('[libmpv] MPV 服务底层就绪');
+    }
+  } catch (e) {
+    fileLogger.w(`[libmpv] 服务初始化失败: ${(e as Error).message}`);
+  }
+
+  // ======================================================================
+  // 3. 其他初始化逻辑
+  // ======================================================================
   try {
     const m = dataDirReport.migration;
     const migDesc = m
@@ -264,11 +235,8 @@ app.whenReady().then(async () => {
     } else {
       fileLogger.i(`数据目录: ${dataDirReport.target}（模式 ${dataDirReport.mode}；${migDesc}）`);
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 
-  // 启动即记录资源根定位结果
   try {
     const { resourcesDir, resourcesDirDebug } = await import('./util/paths');
     const dir = resourcesDir();
@@ -288,14 +256,12 @@ app.whenReady().then(async () => {
   }
   try {
     const { initProxySettings } = await import('./net/proxy');
-    const { userDataDir } = await import('./util/paths');
     initProxySettings(join(userDataDir(), 'proxy.json'));
   } catch (e) {
     fileLogger.w('代理设置初始化失败：' + (e as Error).message);
   }
   try {
     const { initPlayDiag } = await import('./util/playDiag');
-    const { userDataDir } = await import('./util/paths');
     initPlayDiag({
       logDir: () => join(userDataDir(), 'logs'),
       log: (m: string) => fileLogger.i(m),
@@ -303,13 +269,11 @@ app.whenReady().then(async () => {
   } catch (e) {
     fileLogger.w('播放诊断初始化失败：' + (e as Error).message);
   }
+  
   registerIpc(host, dav, dlna, updater, localPkgs);
-
   bindLiveImporter((srcPath, opts) => importLiveFileFromPath(host, srcPath, opts));
   registerLiveSubscriptionIpc();
 
-  // ★ 2026-11-15（用户要求）：配置自愈 —— 从文件本体（imports/py、local-live、live-subscriptions）
-  //   补全 user-config.json 里缺失的 sources / lives。覆盖「备份也没有、但文件还在」的情况。
   try {
     const r = host.healUserConfig();
     if (r.sources + r.lives + r.subs > 0) {
@@ -319,7 +283,6 @@ app.whenReady().then(async () => {
     fileLogger.w(`[heal] 启动自愈失败：${(e as Error).message}`);
   }
 
-  // ★ 2026-11-10（用户要求）：启动后延迟 10 秒检查网络 py 源是否有更新。
   setTimeout(() => {
     void host.checkPyUpdates().catch((e) => fileLogger.w('py 更新检查失败：' + (e as Error).message));
   }, 10_000);
@@ -336,10 +299,10 @@ app.whenReady().then(async () => {
     void host.quarkDeletePending().catch(() => undefined);
   });
   void host.quarkDeletePending().catch(() => undefined);
+  
+  // 4. 创建窗口
   createWindow();
 
-  // ★ 2026-11-13（用户要求「软件开启就校验网络直播源」）：窗口创建后 300ms 开始校验，
-  //   不阻塞首屏；有变化 → 主进程重新导入 + 广播 payload，LivePage 收到后做精细 diff。
   setTimeout(() => {
     void checkAndUpdateSubscriptions()
       .then((r) => {
@@ -374,28 +337,21 @@ app.on('will-quit', (event) => {
     ]).finally(() => app.quit());
     return;
   }
-  // ★ 新增：释放 libmpv 原生资源
-  try { void mpvMain.dispose(); } catch { /* ignore */ }
+  
+  // ★ 释放资源时，安全调用 mpvMain
+  try { void mpvMain?.dispose(); } catch { /* ignore */ }
   try {
     void host.quarkDeletePending();
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   try {
     host.dispose();
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   try {
     torrent.dispose();
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   try {
     proxy.stop();
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 });
 
 process.on('beforeExit', () => {
