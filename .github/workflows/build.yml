@@ -111,7 +111,7 @@ jobs:
         if: github.event.inputs.action != 'delete-only'
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Setup Java
         if: github.event.inputs.action != 'delete-only'
@@ -123,6 +123,43 @@ jobs:
       - name: Install dependencies
         if: github.event.inputs.action != 'delete-only'
         run: npm install
+
+      # ==================================================================
+      # ★ 新增：下载 libmpv 运行时（electron-mpv-video 依赖，直播播放器用）
+      #   electron-mpv-video 是 source-built 原生模块，需要 libmpv SDK 才能编译；
+      #   这里同时下载运行时 DLL，打包进 resources/libmpv/。
+      # ==================================================================
+      - name: Download libmpv runtime
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $mpvDir = "resources/libmpv"
+          if (Test-Path "$mpvDir/libmpv-2.dll") {
+            Write-Host "✓ libmpv-2.dll 已存在，跳过下载"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
+          $url = "https://github.com/zhongfly/mpv-winbuild/releases/latest/download/mpv-dev-x86_64.7z"
+          $archive = Join-Path $env:RUNNER_TEMP "libmpv.7z"
+          $extract = Join-Path $env:RUNNER_TEMP "libmpv-extract"
+          Write-Host "⬇  下载 libmpv: $url"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
+              break
+            } catch {
+              if ($attempts -ge 3) { throw "libmpv 下载失败：$($_.Exception.Message)" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extract" -y | Out-Null
+          $dll = Get-ChildItem $extract -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll 未在压缩包中找到" }
+          Copy-Item $dll.FullName -Destination "$mpvDir/libmpv-2.dll" -Force
+          Write-Host "✓ libmpv-2.dll → $mpvDir ($((Get-Item "$mpvDir/libmpv-2.dll").Length) B)"
 
       # ==================================================================
       # 1. 打印本仓库 resources 目录树
@@ -413,7 +450,8 @@ jobs:
             "resources/jvm/jre/bin/java.exe",
             "resources/jvm/stubs/stubs.jar",
             "resources/jvm/d2j/dex-tools-v2.4.jar",
-            "resources/jvm/libs"
+            "resources/jvm/libs",
+            "resources/libmpv/libmpv-2.dll"
           )
           $missing = @()
           foreach ($m in $must) {
@@ -447,6 +485,9 @@ jobs:
 
           Write-Host "`n=== resources/jvm/libs 内容 ==="
           Get-ChildItem "resources/jvm/libs" -File | Select-Object Name, Length | Format-Table -AutoSize
+
+          Write-Host "`n=== resources/libmpv 内容 ==="
+          Get-ChildItem "resources/libmpv" -File | Select-Object Name, Length | Format-Table -AutoSize
 
       # ==================================================================
       # 8. 测试 & 构建
