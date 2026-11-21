@@ -19,7 +19,7 @@ defineMpvVideoElement();
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      // ★ 不要声明 mode，防止 React 强行赋值
+      // ★ 避开声明 mode，防止 React 在 Render 时强设只读属性导致报错
       'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
@@ -88,6 +88,7 @@ function LiveMpvPlayer({
     let disposed = false;
     const mpvEl = el as any;
 
+    // 通过原生 API 注入属性，完全避开 React DOM 限制
     if (typeof mpvEl.setAttribute === 'function') {
       mpvEl.setAttribute('mode', 'webgl');
     }
@@ -103,6 +104,7 @@ function LiveMpvPlayer({
       if (disposed) return;
 
       try {
+        // 加一点容错，确保组件 API 正确挂载
         if (typeof mpvEl.open === 'function') {
           await mpvEl.open(url);
         } else {
@@ -123,7 +125,7 @@ function LiveMpvPlayer({
     return () => {
       disposed = true;
       try { mpvEl.stop(); } catch { /* ignore */ }
-      // ★ 绝对不要调用 destroy()，否则会触发 not attached 报错
+      // ★ 注意：不要调用 destroy()，避免主进程解除窗口绑定引发下一次调用报错
     };
   }, [url, el, onModeDetected, onError]);
 
@@ -136,7 +138,7 @@ function LiveMpvPlayer({
 }
 
 // ----------------------------------------------------------------------
-// 播放器 2：Web 播放器 (原生 video + hls.js)
+// 播放器 2：Web 播放器 (hls.js + 原生 video)
 // ----------------------------------------------------------------------
 function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -199,7 +201,6 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
     />
   );
 }
-
 
 export default function LivePage() {
   const [lives, setLives] = useState<LiveBean[]>([]);
