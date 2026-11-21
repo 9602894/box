@@ -108,9 +108,6 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      # ============================================================
-      # 关键修改：直接用 7z e 提取 libmpv-2.dll，不依赖压缩包内部目录结构
-      # ============================================================
       - name: Prepare libmpv SDK (for electron-mpv-video native build)
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
@@ -120,7 +117,7 @@ jobs:
           $libDir     = "$libmpvRoot\lib"
           $binDir     = "$libmpvRoot\bin"
 
-          if ((Test-Path "$includeDir\mpv\client.h") -and (Test-Path "$libDir\mpv.lib") -and (Test-Path "$binDir\libmpv-2.dll")) {
+          if ((Test-Path "$includeDir\mpv\client.h") -and (Test-Path "$includeDir\mpv\render.h") -and (Test-Path "$libDir\mpv.lib") -and (Test-Path "$binDir\libmpv-2.dll")) {
             Write-Host "✓ 完整的 libmpv SDK 已存在，跳过下载"
             exit 0
           }
@@ -143,47 +140,37 @@ jobs:
           $sdkArchive = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk.7z"
           Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkArchive -UseBasicParsing -TimeoutSec 300
 
-          # ★ 用 7z e（扁平提取）直接把 libmpv-2.dll 解压到 $binDir，无视任何子目录
-          Write-Host "⚙  扁平提取 libmpv-2.dll → $binDir"
+          Write-Host "⚙  提取 libmpv-2.dll → $binDir"
           & "C:\Program Files\7-Zip\7z.exe" e $sdkArchive "libmpv-2.dll" "-o$binDir" -y | Out-Null
           $dllPath = Join-Path $binDir "libmpv-2.dll"
-          if (-not (Test-Path $dllPath)) { throw "libmpv-2.dll 提取失败，压缩包中可能不包含该文件" }
-          Write-Host "✓ libmpv-2.dll 已就位"
+          if (-not (Test-Path $dllPath)) { throw "libmpv-2.dll 提取失败" }
 
-          # 解压全部内容以获取头文件
           $extractDir = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk-extract"
           if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
           & "C:\Program Files\7-Zip\7z.exe" x $sdkArchive "-o$extractDir" -y | Out-Null
 
-          # 递归搜索 mpv/client.h 并复制头文件
-          $clientHeader = Get-ChildItem $extractDir -Filter "client.h" -Recurse |
-                          Where-Object { $_.FullName -match '\\mpv\\client\.h$' } | Select-Object -First 1
-          if ($clientHeader) {
-            $mpvInclude = Join-Path $includeDir "mpv"
-            New-Item -ItemType Directory -Force -Path $mpvInclude | Out-Null
-            Copy-Item $clientHeader.FullName -Destination "$mpvInclude\client.h" -Force
-            Write-Host "✓ mpv/client.h 已复制"
-          } else {
-            throw "未在压缩包中找到 mpv/client.h"
+          $mpvHeaderDir = Get-ChildItem $extractDir -Directory -Recurse |
+                          Where-Object { $_.Name -eq "mpv" -and (Test-Path "$($_.FullName)\client.h") } |
+                          Select-Object -First 1
+          if (-not $mpvHeaderDir) { throw "未找到 mpv 头文件目录" }
+
+          $destMpv = Join-Path $includeDir "mpv"
+          New-Item -ItemType Directory -Force -Path $destMpv | Out-Null
+          Get-ChildItem $mpvHeaderDir.FullName -Filter "*.h" | Copy-Item -Destination $destMpv -Force
+
+          foreach ($h in @("client.h", "render.h")) {
+            if (-not (Test-Path "$destMpv\$h")) { throw "头文件缺失：mpv/$h" }
           }
+          Write-Host "✓ mpv 头文件已完整复制（client.h, render.h 等）"
 
-          # ============================================================
-          # 生成 mpv.lib：优先用 dumpbin 从已提取的 DLL 自动生成
-          # ============================================================
           $mpvLibDest = Join-Path $libDir "mpv.lib"
-
-          # Level 1: 包内直接有 mpv.lib
           $existingLib = Get-ChildItem $extractDir -Filter "mpv.lib" -Recurse | Select-Object -First 1
           if ($existingLib) {
             Copy-Item $existingLib.FullName -Destination $mpvLibDest -Force
             Write-Host "✓ [Level 1] 使用包内预编译的 mpv.lib"
           } else {
-            # Level 2: 用 dumpbin 从 libmpv-2.dll 导出符号，生成 .def，再生成 .lib
             Write-Host "⚙  [Level 2] 从 libmpv-2.dll 生成 mpv.def / mpv.lib ..."
-
-            # 定位 dumpbin.exe 和 lib.exe
-            $dumpbin = $null
-            $libExe  = $null
+            $dumpbin = $null; $libExe = $null
             $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             if (Test-Path $vsWhere) {
               $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -198,11 +185,10 @@ jobs:
               }
             }
             if (-not (Test-Path $dumpbin)) {
-              # 回退到 PATH
               $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
               $libExe  = (Get-Command lib.exe -ErrorAction SilentlyContinue).Source
             }
-            if (-not $dumpbin -or -not $libExe) { throw "未找到 dumpbin.exe 或 lib.exe，无法从 DLL 生成导入库" }
+            if (-not $dumpbin -or -not $libExe) { throw "未找到 dumpbin.exe 或 lib.exe" }
 
             $defPath = Join-Path $libDir "mpv.def"
             $exportsRaw = & $dumpbin /exports $dllPath 2>&1
@@ -214,9 +200,8 @@ jobs:
                 $defLines += "    $($matches[1])"
               }
             }
-            if ($defLines.Count -le 2) { throw "dumpbin 未解析到任何导出符号" }
+            if ($defLines.Count -le 2) { throw "dumpbin 未解析到导出符号" }
             $defLines | Out-File -FilePath $defPath -Encoding ascii
-            Write-Host "✓ mpv.def 已生成（$($defLines.Count - 2) 个符号）"
 
             Push-Location $libDir
             & $libExe /def:mpv.def "/out:$mpvLibDest" /machine:x64 2>&1 | Out-Null
@@ -225,10 +210,10 @@ jobs:
             Write-Host "✓ [Level 2] 已从 libmpv-2.dll 生成 mpv.lib"
           }
 
-          # 最终验证
           if (-not (Test-Path "$includeDir\mpv\client.h")) { throw "mpv/client.h 未找到" }
+          if (-not (Test-Path "$includeDir\mpv\render.h")) { throw "mpv/render.h 未找到" }
           if (-not (Test-Path $mpvLibDest)) { throw "mpv.lib 未就绪" }
-          Write-Host "✅ libmpv SDK 准备完成"
+          Write-Host "✅ libmpv SDK 准备完成（头文件齐全）"
 
       - name: Set libmpv SDK environment variables
         if: github.event.inputs.action != 'delete-only'
@@ -484,9 +469,7 @@ jobs:
             "resources/libmpv/libmpv-2.dll"
           )
           $missing = @()
-          foreach ($m in $must) {
-            if (-not (Test-Path $m)) { $missing += $m }
-          }
+          foreach ($m in $must) { if (-not (Test-Path $m)) { $missing += $m } }
           if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
           Write-Host "✓ 所有关键资源就绪"
 
