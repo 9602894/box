@@ -14,11 +14,19 @@ import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 
+// ★ 修复：_electronMpvVideo 未注入时（preload 缺失/非 Electron 环境）不定义
+//   mpv-video 元素，让上层能干净地兜底切换到 Web 播放器，而不是抛底层错误。
+function mpvApiAvailable(): boolean {
+  return typeof (window as any)?._electronMpvVideo !== 'undefined';
+}
+
 // 注册 MPV 自定义元素（幂等 + 容错，防止 HMR/重复注册抛错）
 let mpvElementDefined = false;
 function ensureMpvElement() {
   if (mpvElementDefined) return;
-  try { defineMpvVideoElement(); } catch { /* 已注册或环境不支持时忽略 */ }
+  try {
+    if (mpvApiAvailable()) defineMpvVideoElement();
+  } catch { /* 已注册或环境不支持时忽略 */ }
   mpvElementDefined = true;
 }
 ensureMpvElement();
@@ -59,7 +67,7 @@ class StreamDetector {
     if (lower.includes('.m3u8')) return 'hls';
     if (lower.includes('.flv')) return 'flv';
     if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
-    if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
+    if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/test(lower)) return 'native';
     return 'unknown';
   }
 }
@@ -119,6 +127,7 @@ class PlayerErrorBoundary extends Component<
 //   1. 绝不写 mode（只读 getter），也不 setAttribute('mode')
 //   2. 所有元素 API 调用前做能力检测 + try/catch
 //   3. effect 只依赖 [url, el]，回调经 ref 转发，杜绝每次渲染重复 open()
+//   4. 播放前检测 window._electronMpvVideo 是否注入，缺失时直接走错误回调兜底
 // ----------------------------------------------------------------------
 function LiveMpvPlayer({
   url, onModeDetected, onError,
@@ -135,6 +144,12 @@ function LiveMpvPlayer({
     if (!el || !url) return;
     let disposed = false;
     const mpvEl = el as any;
+
+    // ★ 修复点 A：播放前确认 MPV 通道可用，不可用立即上报并交由上层切 Web 内核
+    if (!mpvApiAvailable() || typeof mpvEl.open !== 'function') {
+      cbRef.current.onError?.('MPV 服务不可用（preload 未注入），已自动切换到 Web 播放器');
+      return;
+    }
 
     // 清理上次可能残留的 error 监听
     const onElError = (ev: Event) => {
@@ -239,11 +254,12 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
         if (!data.fatal) return;
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
+            // ★ 网络级失败重试一次；若持续失败多半是跨域/Referer 校验，提示换 MPV 内核
             hls?.startLoad(); break;
           case Hls.ErrorTypes.MEDIA_ERROR:
             hls?.recoverMediaError(); break;
           default:
-            cbRef.current?.(`Web 播放失败: ${data.details}`); break;
+            cbRef.current?.(`Web 播放失败: ${data.details}（跨域或 header 受限的源请改用 MPV 内核）`); break;
         }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl') && lower.includes('.m3u8')) {
@@ -303,6 +319,10 @@ export default function LivePage() {
   // 播放器引擎状态
   const [playerEngine, setPlayerEngine] = useState<PlayerEngine>('mpv');
   const engineSwitchCountRef = useRef(0);
+  // ★ 修复点 B：记录当前频道两个内核各自的失败状态，杜绝 mpv↔web 无限乒乓；
+  //   两个内核都失败时停止切换，展示明确的重试入口。
+  const engineFailedRef = useRef<Record<PlayerEngine, boolean>>({ mpv: false, web: false });
+  const [bothFailed, setBothFailed] = useState(false);
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
   useEffect(() => {
@@ -315,6 +335,8 @@ export default function LivePage() {
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
     engineSwitchCountRef.current = 0; // 换频道后重置引擎切换次数
+    engineFailedRef.current = { mpv: false, web: false }; // 换频道后重置内核失败记录
+    setBothFailed(false);
     setReconnectMsg('');
   }, [playUrl]);
 
@@ -327,22 +349,45 @@ export default function LivePage() {
   const switchEngine = useCallback((target: PlayerEngine) => {
     // 防乒乓：同一频道最多互切 3 次，避免两个引擎都失败时死循环
     if (engineSwitchCountRef.current >= 3) return;
+    // 已经失败过的内核不再切回
+    if (engineFailedRef.current[target]) return;
     engineSwitchCountRef.current += 1;
     setPlayerEngine(target);
   }, []);
 
   const handlePlayerError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
-    // 一个引擎报错 → 自动切到另一个引擎
-    switchEngine(playerEngine === 'mpv' ? 'web' : 'mpv');
+    const failed: PlayerEngine = playerEngine;
+    engineFailedRef.current[failed] = true;
+    const other: PlayerEngine = failed === 'mpv' ? 'web' : 'mpv';
+    if (!engineFailedRef.current[other]) {
+      switchEngine(other);
+    } else {
+      // 两个内核都已失败：停止切换，等待用户重试
+      setBothFailed(true);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playerEngine, switchEngine]);
 
   const handleBoundaryFatal = useCallback(() => {
     // 渲染期崩溃（如只读属性赋值）→ 切到另一个引擎
-    switchEngine(playerEngine === 'mpv' ? 'web' : 'mpv');
+    const failed: PlayerEngine = playerEngine;
+    engineFailedRef.current[failed] = true;
+    const other: PlayerEngine = failed === 'mpv' ? 'web' : 'mpv';
+    if (!engineFailedRef.current[other]) switchEngine(other);
+    else setBothFailed(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playerEngine, switchEngine]);
+
+  // ★ 两个内核都失败后的手动重试：重置状态并强制重挂载当前引擎
+  const retryPlayback = useCallback(() => {
+    engineSwitchCountRef.current = 0;
+    engineFailedRef.current = { mpv: false, web: false };
+    setBothFailed(false);
+    setReconnectMsg('');
+    setPlayerEngine('mpv');
+    setReconnectKey((k) => k + 1);
+  }, []);
 
   const reloadLives = useCallback(async () => {
     try {
@@ -653,8 +698,20 @@ export default function LivePage() {
                   {reconnectMsg && (
                     <div style={{
                       position: 'absolute', top: 12, left: 12, padding: '6px 12px', borderRadius: 6,
-                      background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13, pointerEvents: 'none', zIndex: 20,
-                    }}>{reconnectMsg}</div>
+                      background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
+                      pointerEvents: bothFailed ? 'auto' : 'none', zIndex: 20,
+                    }}>
+                      <span>{reconnectMsg}</span>
+                      {bothFailed && (
+                        <button
+                          className="btn"
+                          style={{ marginLeft: 10, padding: '2px 10px', cursor: 'pointer', fontSize: 12 }}
+                          onClick={retryPlayback}
+                        >
+                          重试
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               ) : (
