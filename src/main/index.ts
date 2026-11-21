@@ -30,12 +30,10 @@ import {
   checkAndUpdateSubscriptions,
 } from './LiveSubscriptionManager';
 import { importLiveFileFromPath } from './live/importLiveFile';
-// ★ 直播 libmpv 服务
-import { createMpvMain } from 'electron-mpv-video/main';
+// ★ 直播 libmpv 服务：统一托管（含所有窗口的 attachWindow）
+import { initMpvService, disposeMpvService } from './player/mpvService';
 
 declare const __dirname: string;
-
-let mpvMain: ReturnType<typeof createMpvMain> | null = null;
 
 try {
   const dir = userDataDir();
@@ -144,16 +142,6 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
-  // ★ 核心修复：窗口实例化后立即注册给 MPV 服务！
-  if (mpvMain) {
-    try {
-      mpvMain.attachWindow(mainWindow);
-      fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务');
-    } catch (e) {
-      fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
-    }
-  }
-
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
   };
@@ -186,32 +174,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  // 1. 设置 libmpv 路径
-  try {
-    const { resourcesDir } = await import('./util/paths');
-    const mpvDir = join(resourcesDir(), 'libmpv');
-    if (existsSync(mpvDir)) {
-      process.env.MPV_RUNTIME_DIR = mpvDir;
-      fileLogger.i(`[libmpv] 运行时目录设置成功: ${mpvDir}`);
-    } else {
-      fileLogger.w(`[libmpv] 运行时目录不存在: ${mpvDir}，直播将无法播放`);
-    }
-  } catch (e) {
-    fileLogger.w('[libmpv] 路径探测失败: ' + (e as Error).message);
-  }
+  // 1. 初始化 MPV 服务（内部完成 MPV_RUNTIME_DIR 探测 + createMpvMain +
+  //    全局 browser-window-created 自动挂载，必须在任何窗口创建之前 await）
+  await initMpvService();
 
-  // 2. 初始化 MPV 服务
-  try {
-    mpvMain = createMpvMain();
-    if (typeof (mpvMain as any).whenReady === 'function') {
-      await (mpvMain as any).whenReady();
-      fileLogger.i('[libmpv] MPV 服务底层就绪');
-    }
-  } catch (e) {
-    fileLogger.w(`[libmpv] 服务初始化失败: ${(e as Error).message}`);
-  }
-
-  // 3. 其他初始化
+  // 2. 其他初始化
   try {
     const m = dataDirReport.migration;
     const migDesc = m
@@ -256,7 +223,7 @@ app.whenReady().then(async () => {
   } catch (e) {
     fileLogger.w('播放诊断初始化失败：' + (e as Error).message);
   }
-  
+
   registerIpc(host, dav, dlna, updater, localPkgs);
   bindLiveImporter((srcPath, opts) => importLiveFileFromPath(host, srcPath, opts));
   registerLiveSubscriptionIpc();
@@ -286,8 +253,8 @@ app.whenReady().then(async () => {
     void host.quarkDeletePending().catch(() => undefined);
   });
   void host.quarkDeletePending().catch(() => undefined);
-  
-  // 4. 创建主窗口（此时 mpvMain 已经就绪，挂载万无一失）
+
+  // 3. 创建主窗口（MPV 服务已就绪，browser-window-created 钩子会自动挂载它）
   createWindow();
 
   setTimeout(() => {
@@ -324,8 +291,8 @@ app.on('will-quit', (event) => {
     ]).finally(() => app.quit());
     return;
   }
-  
-  try { void mpvMain?.dispose(); } catch { /* ignore */ }
+
+  try { disposeMpvService(); } catch { /* ignore */ }
   try { void host.quarkDeletePending(); } catch { /* ignore */ }
   try { host.dispose(); } catch { /* ignore */ }
   try { torrent.dispose(); } catch { /* ignore */ }
