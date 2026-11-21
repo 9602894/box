@@ -30,17 +30,21 @@ import {
   checkAndUpdateSubscriptions,
 } from './LiveSubscriptionManager';
 import { importLiveFileFromPath } from './live/importLiveFile';
+// ★ 直播 libmpv 服务
 import { createMpvMain } from 'electron-mpv-video/main';
 
 declare const __dirname: string;
 
+// 全局声明 mpvMain，延迟到 whenReady 后初始化
 let mpvMain: ReturnType<typeof createMpvMain> | null = null;
 
 try {
   const dir = userDataDir();
   backupUserConfig(dir);
   tryRecoverFromBackup(dir);
-} catch { /* 静默 */ }
+} catch {
+  /* 数据目录初始化早期日志可能还没就绪，静默 */
+}
 
 let mainWindow: BrowserWindow | null = null;
 const host = new SpiderHost();
@@ -143,15 +147,6 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
-  if (mpvMain) {
-    try {
-      mpvMain.attachWindow(mainWindow);
-      fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务');
-    } catch (e) {
-      fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
-    }
-  }
-
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
   };
@@ -173,6 +168,18 @@ function createWindow(): void {
     mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
   }
 
+  // ★ 核心修复：必须在窗口完全加载完毕后，再通知 MPV 绑定窗口
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (mpvMain && mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        mpvMain.attachWindow(mainWindow);
+        fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务 (did-finish-load)');
+      } catch (e) {
+        fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
+      }
+    }
+  });
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
@@ -184,6 +191,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // 1. 设置 libmpv 路径
   try {
     const { resourcesDir } = await import('./util/paths');
     const mpvDir = join(resourcesDir(), 'libmpv');
@@ -197,6 +205,7 @@ app.whenReady().then(async () => {
     fileLogger.w('[libmpv] 路径探测失败: ' + (e as Error).message);
   }
 
+  // 2. 初始化 MPV 服务
   try {
     mpvMain = createMpvMain();
     if (typeof (mpvMain as any).whenReady === 'function') {
@@ -207,15 +216,14 @@ app.whenReady().then(async () => {
     fileLogger.w(`[libmpv] 服务初始化失败: ${(e as Error).message}`);
   }
 
+  // 3. 其他初始化
   try {
     const m = dataDirReport.migration;
     const migDesc = m
       ? `迁移=${m.status}${m.files ? `（${m.files} 文件 / ${(m.bytes / 1024 / 1024).toFixed(1)}MB）` : ''}${m.skipped ? `，跳过可重建缓存 ${m.skipped} 项` : ''}${m.status === 'moved' ? '（整目录移动）' : ''}${m.cleanedLegacy ? '，旧目录已清理' : ''}${m.error ? `，注意：${m.error}` : ''}`
       : '迁移=无旧数据';
     if (dataDirReport.mode === 'fallback') {
-      fileLogger.w(
-        `数据目录: ${dataDirReport.target}（回退，计划目录 ${dataDirReport.planned}）：${dataDirReport.reason || ''}`,
-      );
+      fileLogger.w(`数据目录: ${dataDirReport.target}（回退，计划目录 ${dataDirReport.planned}）：${dataDirReport.reason || ''}`);
     } else {
       fileLogger.i(`数据目录: ${dataDirReport.target}（模式 ${dataDirReport.mode}；${migDesc}）`);
     }
@@ -284,6 +292,7 @@ app.whenReady().then(async () => {
   });
   void host.quarkDeletePending().catch(() => undefined);
   
+  // 4. 创建主窗口
   createWindow();
 
   setTimeout(() => {
@@ -322,18 +331,10 @@ app.on('will-quit', (event) => {
   }
   
   try { void mpvMain?.dispose(); } catch { /* ignore */ }
-  try {
-    void host.quarkDeletePending();
-  } catch { /* ignore */ }
-  try {
-    host.dispose();
-  } catch { /* ignore */ }
-  try {
-    torrent.dispose();
-  } catch { /* ignore */ }
-  try {
-    proxy.stop();
-  } catch { /* ignore */ }
+  try { void host.quarkDeletePending(); } catch { /* ignore */ }
+  try { host.dispose(); } catch { /* ignore */ }
+  try { torrent.dispose(); } catch { /* ignore */ }
+  try { proxy.stop(); } catch { /* ignore */ }
 });
 
 process.on('beforeExit', () => {
