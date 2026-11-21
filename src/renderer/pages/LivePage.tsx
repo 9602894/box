@@ -11,6 +11,7 @@ import {
   resolveDirectPlaybackMode, type PlaybackMode,
 } from '../live/livePlaybackProbe';
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
+import Hls from 'hls.js'; // ★ 引入 hls.js 用于 Web 播放器解析直播流
 
 // 注册 MPV 自定义元素
 defineMpvVideoElement();
@@ -18,9 +19,8 @@ defineMpvVideoElement();
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
-        mode?: 'shared-texture' | 'webgl' | 'canvas2d';
-      };
+      // ★ 删除了 mode 属性的声明，防止 TS 提示和 React 强行赋值
+      'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
 }
@@ -116,39 +116,55 @@ function LiveVideoPlayer({
     };
   }, [url]);
 
+  // ★ 核心修复：去掉了原本导致崩溃的 mode="webgl"
   return (
     <mpv-video
       ref={videoRef as any}
-      mode="webgl"
       style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
     />
   );
 }
 
 // ----------------------------------------------------------------------
-// 播放器 2：Web 播放器 (跟点播一样的原生播放器)
-// 提示：如果你点播页面有封装好的 <VodPlayer>，可以直接引入替换这里
+// 播放器 2：Web 播放器 (原生 video + hls.js)
 // ----------------------------------------------------------------------
 function WebLivePlayer({ url }: { url: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
-    const el = videoRef.current;
-    if (!el || !url) return;
-    
-    // 原生 video 播放器直接赋值 src
-    // 注意：如果你的直播流是 m3u8，且浏览器原生不支持，可能这里需要引入 hls.js 进行解析
-    el.src = url;
-    
-    // 自动播放逻辑
-    el.play().catch((err) => {
-      console.warn('[WebPlayer] 自动播放被阻止或失败:', err);
-    });
+    const video = videoRef.current;
+    if (!video || !url) return;
+
+    let hls: Hls | null = null;
+
+    // 如果是 m3u8 并且浏览器支持 MSE，使用 hls.js
+    if (url.includes('.m3u8') && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch((e) => console.warn('WebPlayer 自动播放被拦截:', e));
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari 原生支持 m3u8
+      video.src = url;
+      video.addEventListener('loadedmetadata', () => video.play().catch(() => {}));
+    } else {
+      // 其他格式直接扔给 video
+      video.src = url;
+      video.play().catch((e) => console.warn('WebPlayer 播放失败:', e));
+    }
 
     return () => {
-      el.pause();
-      el.removeAttribute('src');
-      el.load();
+      if (hls) {
+        hls.destroy();
+      }
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
     };
   }, [url]);
 
@@ -490,12 +506,12 @@ export default function LivePage() {
           {playModeReason ? `（${playModeReason}）` : ''}
         </span>
         
-        {/* ★ 新增：切换播放器按钮 */}
+        {/* ★ 切换播放器按钮 */}
         <button
           className="btn"
           style={{ marginLeft: 12, fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
           onClick={() => setPlayerEngine((p) => (p === 'mpv' ? 'web' : 'mpv'))}
-          title="切换内核：MPV 支持更多格式；Web 为原生播放器"
+          title="切换内核：MPV 支持更多格式；Web 为原生播放器+hls.js"
         >
           切换播放器 ({playerEngine === 'mpv' ? 'MPV' : 'Web'})
         </button>
