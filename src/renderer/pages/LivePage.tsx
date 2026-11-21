@@ -13,13 +13,12 @@ import {
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 import Hls from 'hls.js';
 
-// 确保在 React 挂载前注册元素
+// 注册 MPV 自定义元素
 defineMpvVideoElement();
 
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      // ★ 这里只声明通用的 HTMLElement 属性，不声明 mode，避免 React 强制赋值报错
       'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
@@ -88,7 +87,6 @@ function LiveMpvPlayer({
     let disposed = false;
     const mpvEl = el as any;
 
-    // ★ 通过原生 DOM API 设置属性，绕过 React 的赋值限制
     if (typeof mpvEl.setAttribute === 'function') {
       mpvEl.setAttribute('mode', 'webgl');
     }
@@ -104,10 +102,15 @@ function LiveMpvPlayer({
       if (disposed) return;
 
       try {
-        // 部分版本可能需要等待 open 返回
-        await mpvEl.open(url);
+        if (typeof mpvEl.open === 'function') {
+          await mpvEl.open(url);
+        } else {
+          mpvEl.src = url;
+        }
         if (disposed) return;
-        await mpvEl.play();
+        if (typeof mpvEl.play === 'function') {
+          await mpvEl.play();
+        }
       } catch (err) {
         if (!disposed) {
           console.error('[mpv] live open failed', err);
@@ -119,7 +122,8 @@ function LiveMpvPlayer({
     return () => {
       disposed = true;
       try { mpvEl.stop(); } catch { /* ignore */ }
-      try { mpvEl.destroy(); } catch { /* ignore */ }
+      // ★ 关键修复：不要调用 destroy()，防止解绑主进程窗口状态，否则下次播放会报 not attached
+      // try { mpvEl.destroy(); } catch { /* ignore */ }
     };
   }, [url, el, onModeDetected, onError]);
 
@@ -231,7 +235,6 @@ export default function LivePage() {
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
 
-  // ★ 播放器引擎状态，默认 MPV，如果你发现 Web 更稳，可以在这里改成 'web'
   const [playerEngine, setPlayerEngine] = useState<'mpv' | 'web'>('mpv');
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
@@ -498,7 +501,6 @@ export default function LivePage() {
           方式：{playMode === 'vod' ? '点播' : '直播'}{playModeReason ? `（${playModeReason}）` : ''}
         </span>
         
-        {/* 播放器切换按钮 */}
         <button
           className="btn"
           style={{ marginLeft: 12, fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
