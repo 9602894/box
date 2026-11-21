@@ -39,6 +39,8 @@ import {
   checkAndUpdateSubscriptions,
 } from './LiveSubscriptionManager';
 import { importLiveFileFromPath } from './live/importLiveFile';
+// ★ 2026-11-20：直播 libmpv 服务（electron-mpv-video）
+import { createMpvMain } from 'electron-mpv-video/main';
 // esbuild 打成 CJS：__dirname 由 Node 提供（= dist/）。资源在 dist/../../resources。
 declare const __dirname: string;
 
@@ -54,6 +56,8 @@ try {
 
 let mainWindow: BrowserWindow | null = null;
 const host = new SpiderHost();
+// ★ 2026-11-20：直播 libmpv 服务（只 attach 主窗口，点播 playerWindow 不接）
+const mpvMain = createMpvMain();
 /**
  * ★ 2026-09-29：磁力（BT）引擎（用户选定方案 B）—— aria2c sidecar + 本机中继 `/bt` + 外部播放器接力。
  * 懒启动（首次磁力播放才拉起 aria2c），退出时 dispose（另有 `--stop-with-process` 兜底防孤儿）。
@@ -194,6 +198,9 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
+  // ★ 新增：授权主窗口使用 libmpv（直播播放器 <mpv-video> 依赖此授权）
+  mpvMain.attachWindow(mainWindow);
+
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
   };
@@ -228,6 +235,22 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // ★ 新增：libmpv 运行时路径（开发=resources/libmpv，打包后=resources/libmpv）
+  //   electron-mpv-video 默认查找 %USERPROFILE%\libmpv\bin，这里通过环境变量覆盖，
+  //   保证自包含 exe 能找到随包分发的 libmpv-2.dll。
+  try {
+    const { resourcesDir } = await import('./util/paths');
+    const mpvDir = join(resourcesDir(), 'libmpv');
+    if (existsSync(mpvDir)) {
+      process.env.MPV_RUNTIME_DIR = mpvDir;
+      fileLogger.i(`[libmpv] 运行时目录: ${mpvDir}`);
+    } else {
+      fileLogger.w(`[libmpv] 运行时目录不存在: ${mpvDir}，直播将无法播放`);
+    }
+  } catch (e) {
+    fileLogger.w('[libmpv] 路径探测失败: ' + (e as Error).message);
+  }
+
   // ★ 2026-09-30 数据目录（安装目录/data；老用户自动迁移 + 清理旧 C 盘目录）——排障第一现场
   try {
     const m = dataDirReport.migration;
@@ -351,6 +374,8 @@ app.on('will-quit', (event) => {
     ]).finally(() => app.quit());
     return;
   }
+  // ★ 新增：释放 libmpv 原生资源
+  try { void mpvMain.dispose(); } catch { /* ignore */ }
   try {
     void host.quarkDeletePending();
   } catch {
