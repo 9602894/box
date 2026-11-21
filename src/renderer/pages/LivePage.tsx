@@ -19,6 +19,7 @@ defineMpvVideoElement();
 declare global {
   namespace JSX {
     interface IntrinsicElements {
+      // ★ 不要声明 mode，防止 React 强行赋值
       'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
@@ -122,8 +123,7 @@ function LiveMpvPlayer({
     return () => {
       disposed = true;
       try { mpvEl.stop(); } catch { /* ignore */ }
-      // ★ 关键修复：不要调用 destroy()，防止解绑主进程窗口状态，否则下次播放会报 not attached
-      // try { mpvEl.destroy(); } catch { /* ignore */ }
+      // ★ 绝对不要调用 destroy()，否则会触发 not attached 报错
     };
   }, [url, el, onModeDetected, onError]);
 
@@ -136,7 +136,7 @@ function LiveMpvPlayer({
 }
 
 // ----------------------------------------------------------------------
-// 播放器 2：Web 播放器 (hls.js + 原生 video)
+// 播放器 2：Web 播放器 (原生 video + hls.js)
 // ----------------------------------------------------------------------
 function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -156,11 +156,7 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
     };
 
     if (url.includes('.m3u8') && Hls.isSupported()) {
-      hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: true,
-        backBufferLength: 90,
-      });
+      hls = new Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 90 });
       hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, play);
@@ -169,17 +165,11 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
-              console.warn('[WebPlayer] 网络错误，尝试恢复...');
-              hls?.startLoad();
-              break;
+              hls?.startLoad(); break;
             case Hls.ErrorTypes.MEDIA_ERROR:
-              console.warn('[WebPlayer] 媒体错误，尝试恢复...');
-              hls?.recoverMediaError();
-              break;
+              hls?.recoverMediaError(); break;
             default:
-              console.error('[WebPlayer] 致命错误', data);
-              onError?.(`Web 播放失败: ${data.details}`);
-              break;
+              onError?.(`Web 播放失败: ${data.details}`); break;
           }
         }
       });
@@ -235,6 +225,7 @@ export default function LivePage() {
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
 
+  // 播放器引擎状态
   const [playerEngine, setPlayerEngine] = useState<'mpv' | 'web'>('mpv');
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
@@ -249,23 +240,6 @@ export default function LivePage() {
     lastReconnectAtRef.current = 0;
     setReconnectMsg('');
   }, [playUrl]);
-
-  const doReconnect = useCallback(() => {
-    const now = Date.now();
-    if (now - lastReconnectAtRef.current < 3000) return;
-    lastReconnectAtRef.current = now;
-    reconnectCountRef.current += 1;
-    const n = reconnectCountRef.current;
-    if (n > MAX_RECONNECT) {
-      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
-      return;
-    }
-    setReconnectMsg(`重新加载中…（第 ${n} 次）`);
-    setReconnectKey((k) => k + 1);
-    window.setTimeout(() => {
-      setReconnectMsg((cur) => (cur.startsWith('重新加载中') ? '' : cur));
-    }, 3000);
-  }, []);
 
   const handlePlayerError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
