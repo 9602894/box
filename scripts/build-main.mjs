@@ -15,7 +15,9 @@ const opts = {
   sourcemap: true,
   // ★ 2026-09-24：wasm 解压库（字幕压缩包）走 external，运行时从 node_modules 加载，
   //   wasm 二进制由代码内 `wasmBinary` 显式传入（不依赖库内部的 __dirname 路径解析）。
-  external: ['electron', 'iconv-lite', 'fast-xml-parser', 'node-unrar-js', '7z-wasm'],
+  // ★ 2026-11-21：将 electron-mpv-video 加入 external，防止其内部的 ESM 语法(import.meta.url)
+  //   被强行打包进 CJS 导致主进程报 ERR_INVALID_ARG_VALUE 崩溃。
+  external: ['electron', 'iconv-lite', 'fast-xml-parser', 'node-unrar-js', '7z-wasm', 'electron-mpv-video'],
   logLevel: 'info',
 };
 
