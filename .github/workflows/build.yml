@@ -34,14 +34,8 @@ on:
 permissions:
   contents: write
 
-# ==================================================================
-# 全局镜像加速配置（国内网络环境必需）
-# ==================================================================
 env:
   GH_PROXY: "https://gh-proxy.com/"
-  # 备选镜像（若主镜像失效可切换）：
-  # GH_PROXY: "https://ghproxy.net/"
-  # GH_PROXY: "https://ghproxy.homeboyc.cn/"
 
 jobs:
   build-windows:
@@ -120,16 +114,106 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # ==================================================================
+      # ★ 关键修正：为 electron-mpv-video 准备完整的 libmpv SDK
+      #   构建原生模块需要 mpv/client.h 和 mpv.lib，而非仅运行时 DLL。
+      # ==================================================================
+      - name: Prepare libmpv SDK (for electron-mpv-video native build)
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $libmpvRoot = "$env:USERPROFILE\libmpv"
+          $includeDir = "$libmpvRoot\include"
+          $libDir = "$libmpvRoot\lib"
+          $binDir = "$libmpvRoot\bin"
+
+          # 检查是否已经准备好，避免重复下载
+          if ((Test-Path "$includeDir\mpv\client.h") -and (Test-Path "$libDir\mpv.lib") -and (Test-Path "$binDir\libmpv-2.dll")) {
+            Write-Host "✓ 完整的 libmpv SDK 已存在，跳过下载"
+            exit 0
+          }
+
+          Write-Host "⬇  下载 libmpv SDK (mpv-dev-x86_64)..."
+          New-Item -ItemType Directory -Force -Path $includeDir, $libDir, $binDir | Out-Null
+
+          # 使用 shinchiro/mpv-winbuild-cmake 的 latest mpv-dev 包，通常包含开发文件
+          # 如果此链接失效，可替换为其他包含完整 SDK 的源
+          $sdkUrl = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/latest/download/mpv-dev-x86_64-v3.7z"
+          $sdkArchive = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk.7z"
+          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk-extract"
+
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try {
+              Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkArchive -UseBasicParsing -TimeoutSec 300
+              break
+            } catch {
+              if ($attempts -ge 3) { throw "libmpv SDK 下载失败：$($_.Exception.Message)" }
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+          & "C:\Program Files\7-Zip\7z.exe" x $sdkArchive -o"$extractDir" -y | Out-Null
+
+          # 解压后目录结构通常是 `include/` 和 `lib/` 或 `bin/`
+          $root = Get-ChildItem $extractDir -Directory | Select-Object -First 1
+          if (-not $root) { throw "SDK 压缩包结构异常，未找到根目录" }
+
+          # 复制 include
+          if (Test-Path "$($root.FullName)\include") {
+            Copy-Item "$($root.FullName)\include\*" -Destination $includeDir -Recurse -Force
+          } else {
+            # 有些包直接是 include/ 内容在根目录
+            Copy-Item "$($root.FullName)\mpv" -Destination "$includeDir\mpv" -Recurse -Force
+          }
+
+          # 复制 lib (mpv.lib)
+          $libFile = Get-ChildItem $root.FullName -Filter "mpv.lib" -Recurse | Select-Object -First 1
+          if ($libFile) {
+            Copy-Item $libFile.FullName -Destination "$libDir\mpv.lib" -Force
+          } else {
+            throw "SDK 中未找到 mpv.lib"
+          }
+
+          # 复制 bin (libmpv-2.dll) —— 如果存在
+          $dllFile = Get-ChildItem $root.FullName -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
+          if ($dllFile) {
+            Copy-Item $dllFile.FullName -Destination "$binDir\libmpv-2.dll" -Force
+          }
+
+          # 验证关键文件
+          if (-not (Test-Path "$includeDir\mpv\client.h")) { throw "mpv/client.h 未找到" }
+          if (-not (Test-Path "$libDir\mpv.lib")) { throw "mpv.lib 未找到" }
+          Write-Host "✓ libmpv SDK 准备完成"
+
+      # ==================================================================
+      # ★ 关键：设置环境变量，让 electron-mpv-video 的 node-gyp 能找到 SDK
+      # ==================================================================
+      - name: Set libmpv SDK environment variables
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          $mpvRoot = "$env:USERPROFILE\libmpv"
+          echo "MPV_INCLUDE_DIR=$mpvRoot\include" >> $env:GITHUB_ENV
+          echo "MPV_LIB=$mpvRoot\lib\mpv.lib" >> $env:GITHUB_ENV
+          echo "MPV_RUNTIME_DIR=$mpvRoot\bin" >> $env:GITHUB_ENV
+          Write-Host "MPV_INCLUDE_DIR = $mpvRoot\include"
+          Write-Host "MPV_LIB = $mpvRoot\lib\mpv.lib"
+          Write-Host "MPV_RUNTIME_DIR = $mpvRoot\bin"
+
+      # ==================================================================
+      # 现在再执行 npm install，electron-mpv-video 才能成功构建
+      # ==================================================================
       - name: Install dependencies
         if: github.event.inputs.action != 'delete-only'
         run: npm install
 
       # ==================================================================
-      # ★ 新增：下载 libmpv 运行时（electron-mpv-video 依赖，直播播放器用）
-      #   electron-mpv-video 是 source-built 原生模块，需要 libmpv SDK 才能编译；
-      #   这里同时下载运行时 DLL，打包进 resources/libmpv/。
+      # ★ 下载 libmpv 运行时 DLL (用于打包分发，非构建依赖)
       # ==================================================================
-      - name: Download libmpv runtime
+      - name: Download libmpv runtime (for packaging)
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
@@ -140,26 +224,16 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
           $url = "https://github.com/zhongfly/mpv-winbuild/releases/latest/download/mpv-dev-x86_64.7z"
-          $archive = Join-Path $env:RUNNER_TEMP "libmpv.7z"
-          $extract = Join-Path $env:RUNNER_TEMP "libmpv-extract"
-          Write-Host "⬇  下载 libmpv: $url"
-          $attempts = 0
-          while ($attempts -lt 3) {
-            $attempts++
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
-              break
-            } catch {
-              if ($attempts -ge 3) { throw "libmpv 下载失败：$($_.Exception.Message)" }
-              Start-Sleep -Seconds 5
-            }
-          }
+          $archive = Join-Path $env:RUNNER_TEMP "libmpv-runtime.7z"
+          $extract = Join-Path $env:RUNNER_TEMP "libmpv-runtime-extract"
+          Write-Host "⬇  下载 libmpv 运行时: $url"
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extract" -y | Out-Null
           $dll = Get-ChildItem $extract -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
           if (-not $dll) { throw "libmpv-2.dll 未在压缩包中找到" }
           Copy-Item $dll.FullName -Destination "$mpvDir/libmpv-2.dll" -Force
-          Write-Host "✓ libmpv-2.dll → $mpvDir ($((Get-Item "$mpvDir/libmpv-2.dll").Length) B)"
+          Write-Host "✓ libmpv-2.dll → $mpvDir"
 
       # ==================================================================
       # 1. 打印本仓库 resources 目录树
@@ -175,12 +249,6 @@ jobs:
               Format-Table -AutoSize
           } else {
             throw "本仓库没有 resources 目录"
-          }
-          Write-Host "========== 检查 resources/js-lib =========="
-          if (Test-Path "resources/js-lib") {
-            Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
-          } else {
-            Write-Warning "本仓库 resources/js-lib 目录不存在"
           }
 
       # ==================================================================
@@ -215,7 +283,6 @@ jobs:
 
       # ==================================================================
       # 3. dex2jar 完整工具链（通过镜像加速下载）
-      #    关键：下载完整 dex-tools 包，包含所有修复工具
       # ==================================================================
       - name: Prepare dex2jar
         if: github.event.inputs.action != 'delete-only'
@@ -244,17 +311,13 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $d2j | Out-Null
 
-          # ★ 复制所有 jar（包括根目录和 lib 子目录）
           Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
           if (Test-Path "$($inner.FullName)/lib") {
             Get-ChildItem "$($inner.FullName)/lib/*.jar" | Copy-Item -Destination $d2j -Force
           }
-          # 复制 bat/sh 脚本（Windows 下 bat 是关键）
           Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
           Get-ChildItem "$($inner.FullName)/*.sh"  -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
 
-          # ★ 将 dex2jar 的全部运行时依赖复制到 libs/
-          #    这是修复 "DEX 构造器修复工具缺失" 的关键
           $libs = "resources/jvm/libs"
           New-Item -ItemType Directory -Force -Path $libs | Out-Null
           $allJars = Get-ChildItem $d2j -Filter "*.jar" -Recurse -File
@@ -263,7 +326,6 @@ jobs:
             Write-Host "  → libs/$(Split-Path $jar.FullName -Leaf)"
           }
 
-          # 验证关键修复工具是否存在
           $checkJars = @("d2j-dex-recompute-checksum*.jar", "d2j-dex2jar*.jar", "dex-reader*.jar", "dex-ir*.jar")
           foreach ($pattern in $checkJars) {
             $found = Get-ChildItem $d2j -Filter $pattern -Recurse -File | Select-Object -First 1
@@ -460,7 +522,6 @@ jobs:
           }
           if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
 
-          # ★ 额外校验：dex2jar 修复工具是否齐全
           Write-Host "`n=== 校验 dex2jar 修复工具 ==="
           $d2jChecks = @(
             "d2j-dex2jar*.jar",
