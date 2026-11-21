@@ -12,6 +12,7 @@ import {
 } from '../live/livePlaybackProbe';
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 
+// 注册 MPV 自定义元素
 defineMpvVideoElement();
 
 declare global {
@@ -70,6 +71,9 @@ async function detectPlaybackSource(
   return { kind: 'unknown', mode: 'live', reason: 'default-live' };
 }
 
+// ----------------------------------------------------------------------
+// 播放器 1：MPV 播放器 (当前集成的)
+// ----------------------------------------------------------------------
 function LiveVideoPlayer({
   url, onModeDetected, onError,
 }: {
@@ -112,7 +116,6 @@ function LiveVideoPlayer({
     };
   }, [url]);
 
-  // ★ 关键：Electron 33 不支持 shared-texture，必须用 webgl
   return (
     <mpv-video
       ref={videoRef as any}
@@ -121,6 +124,45 @@ function LiveVideoPlayer({
     />
   );
 }
+
+// ----------------------------------------------------------------------
+// 播放器 2：Web 播放器 (跟点播一样的原生播放器)
+// 提示：如果你点播页面有封装好的 <VodPlayer>，可以直接引入替换这里
+// ----------------------------------------------------------------------
+function WebLivePlayer({ url }: { url: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !url) return;
+    
+    // 原生 video 播放器直接赋值 src
+    // 注意：如果你的直播流是 m3u8，且浏览器原生不支持，可能这里需要引入 hls.js 进行解析
+    el.src = url;
+    
+    // 自动播放逻辑
+    el.play().catch((err) => {
+      console.warn('[WebPlayer] 自动播放被阻止或失败:', err);
+    });
+
+    return () => {
+      el.pause();
+      el.removeAttribute('src');
+      el.load();
+    };
+  }, [url]);
+
+  return (
+    <video
+      ref={videoRef}
+      controls
+      autoPlay
+      playsInline
+      style={{ width: '100%', height: '100%', background: '#000', outline: 'none' }}
+    />
+  );
+}
+
 
 export default function LivePage() {
   const [lives, setLives] = useState<LiveBean[]>([]);
@@ -145,6 +187,9 @@ export default function LivePage() {
   const MAX_RECONNECT = 50;
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
+
+  // ★ 新增：播放器引擎选择状态（默认 MPV）
+  const [playerEngine, setPlayerEngine] = useState<'mpv' | 'web'>('mpv');
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
   useEffect(() => {
@@ -444,6 +489,16 @@ export default function LivePage() {
           播放方式：{playMode === 'vod' ? '点播' : '直播'}
           {playModeReason ? `（${playModeReason}）` : ''}
         </span>
+        
+        {/* ★ 新增：切换播放器按钮 */}
+        <button
+          className="btn"
+          style={{ marginLeft: 12, fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
+          onClick={() => setPlayerEngine((p) => (p === 'mpv' ? 'web' : 'mpv'))}
+          title="切换内核：MPV 支持更多格式；Web 为原生播放器"
+        >
+          切换播放器 ({playerEngine === 'mpv' ? 'MPV' : 'Web'})
+        </button>
       </div>
 
       <div className="layout-2 content" style={{ padding: 12 }}>
@@ -520,15 +575,23 @@ export default function LivePage() {
               {playUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
                   {playbackUrl ? (
-                    <LiveVideoPlayer
-                      key={`${playbackUrl}__${reconnectKey}`}
-                      url={playbackUrl}
-                      onModeDetected={(mode, reason) => {
-                        setPlayMode(mode);
-                        setPlayModeReason(reason);
-                      }}
-                      onError={handlePlayerError}
-                    />
+                    // ★ 根据状态决定渲染哪个播放器
+                    playerEngine === 'mpv' ? (
+                      <LiveVideoPlayer
+                        key={`mpv_${playbackUrl}__${reconnectKey}`}
+                        url={playbackUrl}
+                        onModeDetected={(mode, reason) => {
+                          setPlayMode(mode);
+                          setPlayModeReason(reason);
+                        }}
+                        onError={handlePlayerError}
+                      />
+                    ) : (
+                      <WebLivePlayer
+                        key={`web_${playbackUrl}__${reconnectKey}`}
+                        url={playbackUrl}
+                      />
+                    )
                   ) : (
                     <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
                   )}
