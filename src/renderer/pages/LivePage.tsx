@@ -1,5 +1,5 @@
 // src/renderer/pages/LivePage.tsx
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Component, useEffect, useRef, useState, useCallback } from 'react';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
 import type {
@@ -12,14 +12,22 @@ import {
 } from '../live/livePlaybackProbe';
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 import Hls from 'hls.js';
+import mpegts from 'mpegts.js';
 
-// 注册 MPV 自定义元素
-defineMpvVideoElement();
+// 注册 MPV 自定义元素（幂等 + 容错，防止 HMR/重复注册抛错）
+let mpvElementDefined = false;
+function ensureMpvElement() {
+  if (mpvElementDefined) return;
+  try { defineMpvVideoElement(); } catch { /* 已注册或环境不支持时忽略 */ }
+  mpvElementDefined = true;
+}
+ensureMpvElement();
 
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      // ★ 避开声明 mode，防止 React 在 Render 时强设只读属性导致报错
+      // ★ 绝不声明/传递 mode：mpv-video 的 mode 是只读 getter，
+      //   任何赋值（React 属性赋值或元素内部回调赋值）都会抛 TypeError
       'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
@@ -40,6 +48,10 @@ interface LiveSubChangedPayload {
 }
 
 type MediaKind = 'hls' | 'flv' | 'ts' | 'native' | 'unknown';
+type PlayerEngine = 'mpv' | 'web';
+
+// 固定引用，避免每次渲染生成新 style 对象触发无意义的 DOM 写
+const PLAYER_STYLE: React.CSSProperties = { width: '100%', height: '100%', background: '#000', display: 'block' };
 
 class StreamDetector {
   static detectByUrl(url: string): MediaKind {
@@ -72,7 +84,41 @@ async function detectPlaybackSource(
 }
 
 // ----------------------------------------------------------------------
+// 错误边界：单个播放器崩溃只影响自己，绝不允许拖垮整个直播页
+// ----------------------------------------------------------------------
+class PlayerErrorBoundary extends Component<
+  { children: React.ReactNode; onFatal: () => void },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError(): { hasError: boolean } {
+    return { hasError: true };
+  }
+
+  componentDidCatch(err: Error): void {
+    console.error('[Live] 播放器内部错误，已隔离：', err);
+    try { this.props.onFatal(); } catch { /* ignore */ }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="empty" style={{ width: '100%', height: '100%' }}>
+          播放器内部错误，正在自动切换内核…
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ----------------------------------------------------------------------
 // 播放器 1：MPV 播放器
+// ★ 修复要点：
+//   1. 绝不写 mode（只读 getter），也不 setAttribute('mode')
+//   2. 所有元素 API 调用前做能力检测 + try/catch
+//   3. effect 只依赖 [url, el]，回调经 ref 转发，杜绝每次渲染重复 open()
 // ----------------------------------------------------------------------
 function LiveMpvPlayer({
   url, onModeDetected, onError,
@@ -82,72 +128,84 @@ function LiveMpvPlayer({
   onError?: (msg: string) => void;
 }) {
   const [el, setEl] = useState<HTMLElement | null>(null);
+  const cbRef = useRef({ onModeDetected, onError });
+  cbRef.current = { onModeDetected, onError };
 
   useEffect(() => {
     if (!el || !url) return;
     let disposed = false;
     const mpvEl = el as any;
 
-    // 通过原生 API 注入属性，完全避开 React DOM 限制
-    if (typeof mpvEl.setAttribute === 'function') {
-      mpvEl.setAttribute('mode', 'webgl');
-    }
+    // 清理上次可能残留的 error 监听
+    const onElError = (ev: Event) => {
+      if (disposed) return;
+      const detail = (ev as CustomEvent)?.detail;
+      cbRef.current.onError?.(`MPV 播放错误: ${detail || '未知错误'}`);
+    };
+    try { mpvEl.addEventListener?.('error', onElError); } catch { /* ignore */ }
 
     (async () => {
       try {
         const { mode, reason } = await detectPlaybackSource(url);
         if (disposed) return;
-        onModeDetected?.(mode, reason);
+        cbRef.current.onModeDetected?.(mode, reason);
       } catch {
-        if (!disposed) onModeDetected?.('live', 'probe-failed');
+        if (!disposed) cbRef.current.onModeDetected?.('live', 'probe-failed');
       }
       if (disposed) return;
 
       try {
-        // 加一点容错，确保组件 API 正确挂载
+        // 只使用元素明确暴露的 API；不触碰任何只读属性（mode 等）
         if (typeof mpvEl.open === 'function') {
           await mpvEl.open(url);
-        } else {
+          if (disposed) return;
+          if (typeof mpvEl.play === 'function') await mpvEl.play();
+        } else if ('src' in mpvEl) {
           mpvEl.src = url;
-        }
-        if (disposed) return;
-        if (typeof mpvEl.play === 'function') {
-          await mpvEl.play();
+          if (disposed) return;
+          if (typeof mpvEl.play === 'function') await mpvEl.play();
+        } else {
+          throw new Error('mpv-video 元素未暴露可用播放 API');
         }
       } catch (err) {
         if (!disposed) {
           console.error('[mpv] live open failed', err);
-          onError?.(`MPV 播放失败: ${(err as Error).message || '请尝试切换频道或线路'}`);
+          cbRef.current.onError?.(`MPV 播放失败: ${(err as Error).message || '请尝试切换频道或线路'}`);
         }
       }
     })();
 
     return () => {
       disposed = true;
-      try { mpvEl.stop(); } catch { /* ignore */ }
+      try { mpvEl.removeEventListener?.('error', onElError); } catch { /* ignore */ }
+      try { if (typeof mpvEl.pause === 'function') mpvEl.pause(); } catch { /* ignore */ }
+      try { if (typeof mpvEl.stop === 'function') mpvEl.stop(); } catch { /* ignore */ }
       // ★ 注意：不要调用 destroy()，避免主进程解除窗口绑定引发下一次调用报错
     };
-  }, [url, el, onModeDetected, onError]);
+  }, [url, el]);
 
   return (
     <mpv-video
       ref={(node) => setEl(node)}
-      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
+      style={PLAYER_STYLE}
     />
   );
 }
 
 // ----------------------------------------------------------------------
-// 播放器 2：Web 播放器 (hls.js + 原生 video)
+// 播放器 2：Web 播放器 (hls.js + mpegts.js + 原生 video)
 // ----------------------------------------------------------------------
 function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const cbRef = useRef(onError);
+  cbRef.current = onError;
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !url) return;
 
     let hls: Hls | null = null;
+    let flv: mpegts.Player | null = null;
 
     const play = () => {
       video.play().catch((err) => {
@@ -157,25 +215,38 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
       });
     };
 
-    if (url.includes('.m3u8') && Hls.isSupported()) {
+    const lower = url.toLowerCase();
+
+    if (lower.includes('.flv') && mpegts.isSupported()) {
+      // FLV 直播流：走 mpegts.js
+      try {
+        flv = mpegts.createPlayer(
+          { type: 'flv', isLive: true, url },
+          { enableStashBuffer: false, liveBufferLatencyChasing: true },
+        );
+        flv.attachMediaElement(video);
+        flv.load();
+        flv.play();
+      } catch (err) {
+        cbRef.current?.(`Web 播放失败: ${(err as Error).message}`);
+      }
+    } else if (lower.includes('.m3u8') && Hls.isSupported()) {
       hls = new Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 90 });
       hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, play);
-      
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              hls?.startLoad(); break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              hls?.recoverMediaError(); break;
-            default:
-              onError?.(`Web 播放失败: ${data.details}`); break;
-          }
+        if (!data.fatal) return;
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            hls?.startLoad(); break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            hls?.recoverMediaError(); break;
+          default:
+            cbRef.current?.(`Web 播放失败: ${data.details}`); break;
         }
       });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    } else if (video.canPlayType('application/vnd.apple.mpegurl') && lower.includes('.m3u8')) {
       video.src = url;
       video.addEventListener('loadedmetadata', play);
     } else {
@@ -184,12 +255,15 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
     }
 
     return () => {
-      if (hls) hls.destroy();
+      if (hls) { try { hls.destroy(); } catch { /* ignore */ } }
+      if (flv) {
+        try { flv.pause(); flv.unload(); flv.detachMediaElement(); flv.destroy(); } catch { /* ignore */ }
+      }
       video.pause();
       video.removeAttribute('src');
       video.load();
     };
-  }, [url, onError]);
+  }, [url]);
 
   return (
     <video
@@ -197,7 +271,7 @@ function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) 
       controls
       autoPlay
       playsInline
-      style={{ width: '100%', height: '100%', background: '#000', outline: 'none' }}
+      style={{ ...PLAYER_STYLE, outline: 'none' }}
     />
   );
 }
@@ -227,7 +301,8 @@ export default function LivePage() {
   const [playModeReason, setPlayModeReason] = useState('');
 
   // 播放器引擎状态
-  const [playerEngine, setPlayerEngine] = useState<'mpv' | 'web'>('mpv');
+  const [playerEngine, setPlayerEngine] = useState<PlayerEngine>('mpv');
+  const engineSwitchCountRef = useRef(0);
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
   useEffect(() => {
@@ -239,12 +314,35 @@ export default function LivePage() {
     setPlaybackUrl(playUrl);
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
+    engineSwitchCountRef.current = 0; // 换频道后重置引擎切换次数
     setReconnectMsg('');
   }, [playUrl]);
 
+  // ★ 稳定回调：useCallback 保证引用不变，杜绝播放器 effect 每渲染重复 open()
+  const handleModeDetected = useCallback((mode: PlaybackMode, reason: string) => {
+    setPlayMode(mode);
+    setPlayModeReason(reason);
+  }, []);
+
+  const switchEngine = useCallback((target: PlayerEngine) => {
+    // 防乒乓：同一频道最多互切 3 次，避免两个引擎都失败时死循环
+    if (engineSwitchCountRef.current >= 3) return;
+    engineSwitchCountRef.current += 1;
+    setPlayerEngine(target);
+  }, []);
+
   const handlePlayerError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
-  }, []);
+    // 一个引擎报错 → 自动切到另一个引擎
+    switchEngine(playerEngine === 'mpv' ? 'web' : 'mpv');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playerEngine, switchEngine]);
+
+  const handleBoundaryFatal = useCallback(() => {
+    // 渲染期崩溃（如只读属性赋值）→ 切到另一个引擎
+    switchEngine(playerEngine === 'mpv' ? 'web' : 'mpv');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playerEngine, switchEngine]);
 
   const reloadLives = useCallback(async () => {
     try {
@@ -475,7 +573,7 @@ export default function LivePage() {
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           方式：{playMode === 'vod' ? '点播' : '直播'}{playModeReason ? `（${playModeReason}）` : ''}
         </span>
-        
+
         <button
           className="btn"
           style={{ marginLeft: 12, fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
@@ -529,20 +627,26 @@ export default function LivePage() {
               {playUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
                   {playbackUrl ? (
-                    playerEngine === 'mpv' ? (
-                      <LiveMpvPlayer
-                        key={`mpv_${playbackUrl}__${reconnectKey}`}
-                        url={playbackUrl}
-                        onModeDetected={(mode, reason) => { setPlayMode(mode); setPlayModeReason(reason); }}
-                        onError={handlePlayerError}
-                      />
-                    ) : (
-                      <LiveWebPlayer
-                        key={`web_${playbackUrl}__${reconnectKey}`}
-                        url={playbackUrl}
-                        onError={handlePlayerError}
-                      />
-                    )
+                    // ★ key 包含引擎名：切换引擎时强制重挂载，彻底丢弃坏掉的播放器实例
+                    <PlayerErrorBoundary
+                      key={`boundary_${playerEngine}_${playbackUrl}__${reconnectKey}`}
+                      onFatal={handleBoundaryFatal}
+                    >
+                      {playerEngine === 'mpv' ? (
+                        <LiveMpvPlayer
+                          key={`mpv_${playbackUrl}__${reconnectKey}`}
+                          url={playbackUrl}
+                          onModeDetected={handleModeDetected}
+                          onError={handlePlayerError}
+                        />
+                      ) : (
+                        <LiveWebPlayer
+                          key={`web_${playbackUrl}__${reconnectKey}`}
+                          url={playbackUrl}
+                          onError={handlePlayerError}
+                        />
+                      )}
+                    </PlayerErrorBoundary>
                   ) : (
                     <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
                   )}
