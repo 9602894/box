@@ -1,5 +1,7 @@
 // src/main/preload.ts — contextBridge 暴露 window.api
 import { contextBridge, ipcRenderer } from 'electron';
+// ★ 2026-11-20：暴露 electron-mpv-video 的 API（直播播放器 <mpv-video> 依赖）
+import { exposeMpvApi } from 'electron-mpv-video/preload';
 import type { IpcResult } from '../shared/ipc-result';
 import { IPC } from '../shared/ipc-channels';
 import type { SiteConfig, ImportReport, SourceBean, SourceMoveDirection, SourceUpdatePatch, UserConfig, UserProfile, MetaHit, MetaExtra, DiscoverSection, DiscoverGenre, DiscoverGenrePage, MetaImages } from '../shared/types';
@@ -273,3 +275,7 @@ contextBridge.exposeInMainWorld('winboxIpc', {
     return () => { ipcRenderer.removeListener(channel, listener); };
   },
 });
+
+// ★ 新增：暴露 electron-mpv-video 的 API（window._electronMpvVideo）
+//   必须在渲染进程创建 <mpv-video> 之前调用，否则自定义元素初始化会拿不到底层通道。
+exposeMpvApi();
