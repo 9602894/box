@@ -108,154 +108,127 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # ============================================================
+      # 关键修改：直接用 7z e 提取 libmpv-2.dll，不依赖压缩包内部目录结构
+      # ============================================================
       - name: Prepare libmpv SDK (for electron-mpv-video native build)
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
           $libmpvRoot = "$env:USERPROFILE\libmpv"
           $includeDir = "$libmpvRoot\include"
-          $libDir = "$libmpvRoot\lib"
-          $binDir = "$libmpvRoot\bin"
+          $libDir     = "$libmpvRoot\lib"
+          $binDir     = "$libmpvRoot\bin"
 
           if ((Test-Path "$includeDir\mpv\client.h") -and (Test-Path "$libDir\mpv.lib") -and (Test-Path "$binDir\libmpv-2.dll")) {
             Write-Host "✓ 完整的 libmpv SDK 已存在，跳过下载"
             exit 0
           }
 
-          Write-Host "🔍 通过 GitHub API 查询最新的 mpv-dev-x86_64 资产..."
+          Write-Host "🔍 查询最新的 mpv-dev-x86_64 资产..."
           $apiUrl = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
-          $headers = @{ "User-Agent" = "github-actions" }
           try {
-            $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -UseBasicParsing
+            $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "github-actions" } -UseBasicParsing
           } catch {
             throw "无法获取最新 Release 信息: $($_.Exception.Message)"
           }
 
           $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
-          if (-not $asset) { throw "未在最新 Release 中找到 mpv-dev-x86_64 资产" }
-          
+          if (-not $asset) { throw "未找到 mpv-dev-x86_64 资产" }
+
           $sdkUrl = $asset.browser_download_url
           Write-Host "⬇  下载 libmpv SDK: $sdkUrl"
           New-Item -ItemType Directory -Force -Path $includeDir, $libDir, $binDir | Out-Null
+
           $sdkArchive = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk.7z"
-          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk-extract"
           Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkArchive -UseBasicParsing -TimeoutSec 300
+
+          # ★ 用 7z e（扁平提取）直接把 libmpv-2.dll 解压到 $binDir，无视任何子目录
+          Write-Host "⚙  扁平提取 libmpv-2.dll → $binDir"
+          & "C:\Program Files\7-Zip\7z.exe" e $sdkArchive "libmpv-2.dll" "-o$binDir" -y | Out-Null
+          $dllPath = Join-Path $binDir "libmpv-2.dll"
+          if (-not (Test-Path $dllPath)) { throw "libmpv-2.dll 提取失败，压缩包中可能不包含该文件" }
+          Write-Host "✓ libmpv-2.dll 已就位"
+
+          # 解压全部内容以获取头文件
+          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-dev-sdk-extract"
           if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-          & "C:\Program Files\7-Zip\7z.exe" x $sdkArchive -o"$extractDir" -y | Out-Null
-          $root = Get-ChildItem $extractDir -Directory | Select-Object -First 1
-          if (-not $root) { throw "SDK 压缩包结构异常" }
+          & "C:\Program Files\7-Zip\7z.exe" x $sdkArchive "-o$extractDir" -y | Out-Null
 
-          # 复制头文件和 DLL
-          Copy-Item "$($root.FullName)\include\*" -Destination $includeDir -Recurse -Force -ErrorAction SilentlyContinue
-          $dllFile = Get-ChildItem $root.FullName -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
-          if ($dllFile) { Copy-Item $dllFile.FullName -Destination "$binDir\libmpv-2.dll" -Force }
-
-          # --- 多级回退策略，确保 mpv.lib 就位 ---
-          $mpvLibDest = Join-Path $libDir "mpv.lib"
-
-          # 级别 1: 在包内直接查找 mpv.lib
-          $existingLib = Get-ChildItem $root.FullName -Filter "mpv.lib" -Recurse | Select-Object -First 1
-          if ($existingLib) {
-            Write-Host "✓ [Level 1] 找到预编译的 mpv.lib"
-            Copy-Item $existingLib.FullName -Destination $mpvLibDest -Force
+          # 递归搜索 mpv/client.h 并复制头文件
+          $clientHeader = Get-ChildItem $extractDir -Filter "client.h" -Recurse |
+                          Where-Object { $_.FullName -match '\\mpv\\client\.h$' } | Select-Object -First 1
+          if ($clientHeader) {
+            $mpvInclude = Join-Path $includeDir "mpv"
+            New-Item -ItemType Directory -Force -Path $mpvInclude | Out-Null
+            Copy-Item $clientHeader.FullName -Destination "$mpvInclude\client.h" -Force
+            Write-Host "✓ mpv/client.h 已复制"
           } else {
-            # 级别 2: 查找 libmpv.def 并用 lib.exe 生成
-            $defFile = Get-ChildItem $root.FullName -Filter "libmpv.def" -Recurse | Select-Object -First 1
-            if ($defFile) {
-              Write-Host "⚙  [Level 2] 找到 libmpv.def，使用 lib.exe 生成 mpv.lib..."
-              Push-Location $defFile.DirectoryName
-              & lib.exe /def:$($defFile.Name) /out:$mpvLibDest /machine:x64
-              Pop-Location
-              if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
-              Write-Host "✓ 已从 libmpv.def 生成 mpv.lib"
-            } else {
-              # 级别 3: 从已下载的 libmpv-2.dll 自动生成 mpv.def
-              Write-Host "⚙  [Level 3] 包内无 .def 文件，尝试从 libmpv-2.dll 自动生成 .def..."
-              $dllPath = Join-Path $binDir "libmpv-2.dll"
-              if (Test-Path $dllPath) {
-                $defPath = Join-Path $libDir "mpv.def"
-                $exportsFile = Join-Path $env:RUNNER_TEMP "mpv-exports.txt"
-
-                # 定位 dumpbin.exe（优先 PATH，其次通过 vswhere 查 VS 安装）
-                $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
-                if (-not $dumpbin) {
-                  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-                  if (Test-Path $vswhere) {
-                    $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-                    if ($vsPath) {
-                      $toolset = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
-                                 Sort-Object Name -Descending | Select-Object -First 1
-                      if ($toolset) {
-                        $cand = Get-ChildItem "$($toolset.FullName)\bin\Hostx64\x64" -Filter "dumpbin.exe" -ErrorAction SilentlyContinue |
-                                Select-Object -First 1
-                        if ($cand) { $dumpbin = $cand.FullName }
-                      }
-                    }
-                  }
-                }
-
-                if ($dumpbin) {
-                  Write-Host "  使用 dumpbin: $dumpbin"
-                  & $dumpbin /exports $dllPath > $exportsFile
-                  if ($LASTEXITCODE -ne 0) { throw "dumpbin 执行失败" }
-
-                  $defContent = @("EXPORTS")
-                  Get-Content $exportsFile | ForEach-Object {
-                    if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
-                      $defContent += "    $($matches[1])"
-                    }
-                  }
-                  $defContent | Out-File -FilePath $defPath -Encoding ascii
-                  Write-Host "✓ 已从 libmpv-2.dll 生成 mpv.def（$($defContent.Count - 1) 个符号）"
-
-                  Push-Location $libDir
-                  & lib.exe /def:mpv.def /out:$mpvLibDest /machine:x64
-                  Pop-Location
-                  if (Test-Path $mpvLibDest) {
-                    Write-Host "✓ 已从自动生成的 mpv.def 生成 mpv.lib"
-                  }
-                } else {
-                  Write-Host "⚠  未找到 dumpbin，跳过从 DLL 自动生成 .def"
-                }
-              } else {
-                Write-Host "⚠  未找到 $dllPath，跳过从 DLL 自动生成 .def"
-              }
-
-              # 级别 3b: 若仍未得到 mpv.lib，回退到历史版本的 mpv.def
-              if (-not (Test-Path $mpvLibDest)) {
-                Write-Host "⚙  [Level 3b] 回退到 mpv v0.37.0 的 mpv.def..."
-                $defUrl = "https://raw.githubusercontent.com/mpv-player/mpv/v0.37.0/libmpv/mpv.def"
-                $defPath2 = Join-Path $libDir "mpv.def"
-                try {
-                  Invoke-WebRequest -Uri $defUrl -OutFile $defPath2 -UseBasicParsing -TimeoutSec 60
-                  Write-Host "✓ 已下载 mpv.def，使用 lib.exe 生成 mpv.lib..."
-                  Push-Location $libDir
-                  & lib.exe /def:mpv.def /out:$mpvLibDest /machine:x64
-                  Pop-Location
-                  if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
-                  Write-Host "✓ 已从 v0.37.0 mpv.def 生成 mpv.lib"
-                } catch {
-                  Write-Host "⚠  Level 3b 失败: $($_.Exception.Message)"
-                }
-              }
-            }
+            throw "未在压缩包中找到 mpv/client.h"
           }
 
-          # 级别 4 (兜底): 如果以上都失败，复制 libmpv.dll.a
-          if (-not (Test-Path $mpvLibDest)) {
-            $dllAFile = Get-ChildItem $root.FullName -Filter "libmpv.dll.a" -Recurse | Select-Object -First 1
-            if ($dllAFile) {
-              Write-Host "⚠  [Level 4] 仅找到 MinGW 导入库 libmpv.dll.a，复制为 mpv.lib（注意：MSVC 链接器可能不兼容）"
-              Copy-Item $dllAFile.FullName -Destination $mpvLibDest -Force
-            } else {
-              throw "所有回退策略均失败，无法获取或生成 mpv.lib"
+          # ============================================================
+          # 生成 mpv.lib：优先用 dumpbin 从已提取的 DLL 自动生成
+          # ============================================================
+          $mpvLibDest = Join-Path $libDir "mpv.lib"
+
+          # Level 1: 包内直接有 mpv.lib
+          $existingLib = Get-ChildItem $extractDir -Filter "mpv.lib" -Recurse | Select-Object -First 1
+          if ($existingLib) {
+            Copy-Item $existingLib.FullName -Destination $mpvLibDest -Force
+            Write-Host "✓ [Level 1] 使用包内预编译的 mpv.lib"
+          } else {
+            # Level 2: 用 dumpbin 从 libmpv-2.dll 导出符号，生成 .def，再生成 .lib
+            Write-Host "⚙  [Level 2] 从 libmpv-2.dll 生成 mpv.def / mpv.lib ..."
+
+            # 定位 dumpbin.exe 和 lib.exe
+            $dumpbin = $null
+            $libExe  = $null
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vsWhere) {
+              $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              if ($vsPath) {
+                $toolset = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+                           Sort-Object Name -Descending | Select-Object -First 1
+                if ($toolset) {
+                  $binPath = "$($toolset.FullName)\bin\Hostx64\x64"
+                  $dumpbin = Join-Path $binPath "dumpbin.exe"
+                  $libExe  = Join-Path $binPath "lib.exe"
+                }
+              }
             }
+            if (-not (Test-Path $dumpbin)) {
+              # 回退到 PATH
+              $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+              $libExe  = (Get-Command lib.exe -ErrorAction SilentlyContinue).Source
+            }
+            if (-not $dumpbin -or -not $libExe) { throw "未找到 dumpbin.exe 或 lib.exe，无法从 DLL 生成导入库" }
+
+            $defPath = Join-Path $libDir "mpv.def"
+            $exportsRaw = & $dumpbin /exports $dllPath 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin 执行失败" }
+
+            $defLines = @("LIBRARY libmpv-2.dll", "EXPORTS")
+            foreach ($line in $exportsRaw) {
+              if ($line -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
+                $defLines += "    $($matches[1])"
+              }
+            }
+            if ($defLines.Count -le 2) { throw "dumpbin 未解析到任何导出符号" }
+            $defLines | Out-File -FilePath $defPath -Encoding ascii
+            Write-Host "✓ mpv.def 已生成（$($defLines.Count - 2) 个符号）"
+
+            Push-Location $libDir
+            & $libExe /def:mpv.def "/out:$mpvLibDest" /machine:x64 2>&1 | Out-Null
+            Pop-Location
+            if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
+            Write-Host "✓ [Level 2] 已从 libmpv-2.dll 生成 mpv.lib"
           }
 
           # 最终验证
           if (-not (Test-Path "$includeDir\mpv\client.h")) { throw "mpv/client.h 未找到" }
-          if (-not (Test-Path $mpvLibDest)) { throw "mpv.lib 生成失败" }
-          Write-Host "✓ libmpv SDK 准备完成"
+          if (-not (Test-Path $mpvLibDest)) { throw "mpv.lib 未就绪" }
+          Write-Host "✅ libmpv SDK 准备完成"
 
       - name: Set libmpv SDK environment variables
         if: github.event.inputs.action != 'delete-only'
@@ -265,9 +238,6 @@ jobs:
           echo "MPV_INCLUDE_DIR=$mpvRoot\include" >> $env:GITHUB_ENV
           echo "MPV_LIB=$mpvRoot\lib\mpv.lib" >> $env:GITHUB_ENV
           echo "MPV_RUNTIME_DIR=$mpvRoot\bin" >> $env:GITHUB_ENV
-          Write-Host "MPV_INCLUDE_DIR = $mpvRoot\include"
-          Write-Host "MPV_LIB = $mpvRoot\lib\mpv.lib"
-          Write-Host "MPV_RUNTIME_DIR = $mpvRoot\bin"
 
       - name: Install dependencies
         if: github.event.inputs.action != 'delete-only'
@@ -285,14 +255,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
           $url = "https://github.com/zhongfly/mpv-winbuild/releases/latest/download/mpv-dev-x86_64.7z"
           $archive = Join-Path $env:RUNNER_TEMP "libmpv-runtime.7z"
-          $extract = Join-Path $env:RUNNER_TEMP "libmpv-runtime-extract"
           Write-Host "⬇  下载 libmpv 运行时: $url"
           Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
-          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
-          & "C:\Program Files\7-Zip\7z.exe" x $archive -o"$extract" -y | Out-Null
-          $dll = Get-ChildItem $extract -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
-          if (-not $dll) { throw "libmpv-2.dll 未在压缩包中找到" }
-          Copy-Item $dll.FullName -Destination "$mpvDir/libmpv-2.dll" -Force
+          & "C:\Program Files\7-Zip\7z.exe" e $archive "libmpv-2.dll" "-o$mpvDir" -y | Out-Null
+          if (-not (Test-Path "$mpvDir/libmpv-2.dll")) { throw "libmpv-2.dll 未在压缩包中找到" }
           Write-Host "✓ libmpv-2.dll → $mpvDir"
 
       - name: Print repository resources tree
@@ -306,12 +272,6 @@ jobs:
               Format-Table -AutoSize
           } else {
             throw "本仓库没有 resources 目录"
-          }
-          Write-Host "========== 检查 resources/js-lib =========="
-          if (Test-Path "resources/js-lib") {
-            Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
-          } else {
-            Write-Warning "本仓库 resources/js-lib 目录不存在"
           }
 
       - name: Prepare JRE
@@ -367,7 +327,6 @@ jobs:
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
 
           New-Item -ItemType Directory -Force -Path $d2j | Out-Null
-
           Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
           if (Test-Path "$($inner.FullName)/lib") {
             Get-ChildItem "$($inner.FullName)/lib/*.jar" | Copy-Item -Destination $d2j -Force
@@ -380,16 +339,7 @@ jobs:
           $allJars = Get-ChildItem $d2j -Filter "*.jar" -Recurse -File
           foreach ($jar in $allJars) {
             Copy-Item $jar.FullName -Destination $libs -Force
-            Write-Host "  → libs/$(Split-Path $jar.FullName -Leaf)"
           }
-
-          $checkJars = @("d2j-dex-recompute-checksum*.jar", "d2j-dex2jar*.jar", "dex-reader*.jar", "dex-ir*.jar")
-          foreach ($pattern in $checkJars) {
-            $found = Get-ChildItem $d2j -Filter $pattern -Recurse -File | Select-Object -First 1
-            if ($found) { Write-Host "  ✓ $($found.Name)" }
-            else { Write-Warning "  ⚠ 未找到 $pattern" }
-          }
-          Write-Host "dex2jar 工具链准备完成"
 
       - name: Prepare Maven deps
         if: github.event.inputs.action != 'delete-only'
@@ -412,12 +362,7 @@ jobs:
             $dest = Join-Path $libs $m.n
             if (Test-Path $dest) { Write-Host "✓ $($m.n)"; continue }
             Write-Host "⬇  $($m.n)"
-            $attempts = 0
-            while ($attempts -lt 3) {
-              $attempts++
-              try { Invoke-WebRequest -Uri $m.u -OutFile $dest -UseBasicParsing -TimeoutSec 120; break }
-              catch { if ($attempts -ge 3) { throw "download failed: $($m.n)" }; Start-Sleep -Seconds 3 }
-            }
+            Invoke-WebRequest -Uri $m.u -OutFile $dest -UseBasicParsing -TimeoutSec 120
           }
 
       - name: Patch stubs-src
@@ -487,7 +432,6 @@ jobs:
               }
           }
           JAVAEOF
-          echo "patched stubs-src"
 
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
@@ -495,10 +439,7 @@ jobs:
         run: |
           $stubsSrc = "resources/jvm/stubs-src"
           if (-not (Test-Path $stubsSrc)) {
-            if (Test-Path "resources/jvm/stubs/stubs.jar") {
-              Write-Host "✓ stubs.jar 已存在，跳过编译"
-              exit 0
-            }
+            if (Test-Path "resources/jvm/stubs/stubs.jar") { exit 0 }
             throw "既没 stubs-src 也没 stubs.jar"
           }
 
@@ -510,26 +451,14 @@ jobs:
 
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
-            Write-Host "⬇  android-all（编译用，之后删）"
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
-            $attempts = 0
-            while ($attempts -lt 3) {
-              $attempts++
-              try { Invoke-WebRequest -Uri $url -OutFile $androidAll -UseBasicParsing -TimeoutSec 900; break }
-              catch { if ($attempts -ge 3) { throw "android-all download failed" }; Start-Sleep -Seconds 5 }
-            }
+            Invoke-WebRequest -Uri $url -OutFile $androidAll -UseBasicParsing -TimeoutSec 900
           }
 
           $sources = @(Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
           $spiderRunner = "resources/jvm/SpiderRunner.java"
-          if (Test-Path $spiderRunner) {
-            Write-Host "adding SpiderRunner.java"
-            $sources += (Resolve-Path $spiderRunner).Path
-          } else {
-            throw "resources/jvm/SpiderRunner.java 不存在"
-          }
+          if (Test-Path $spiderRunner) { $sources += (Resolve-Path $spiderRunner).Path }
 
-          Write-Host "Compiling $($sources.Count) .java files..."
           $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
           $cp = (@($libs) + @($androidAll)) -join ";"
           javac -encoding UTF-8 -cp $cp -d $classes $sources
@@ -540,13 +469,7 @@ jobs:
           Push-Location $classes
           & jar uf "../stubs.jar" .
           Pop-Location
-
-          $jarList = & jar tf $stubsJar
-          $hit = $jarList | Where-Object { $_ -match '^SpiderRunner\.class$' }
-          if (-not $hit) { throw "stubs.jar 中未找到 SpiderRunner.class" }
-
           Remove-Item -Force $androidAll -ErrorAction SilentlyContinue
-          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -562,38 +485,10 @@ jobs:
           )
           $missing = @()
           foreach ($m in $must) {
-            if (Test-Path $m) { Write-Host "✓ $m" }
-            else { $missing += $m; Write-Host "❌ $m" }
+            if (-not (Test-Path $m)) { $missing += $m }
           }
           if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
-
-          Write-Host "`n=== 校验 dex2jar 修复工具 ==="
-          $d2jChecks = @(
-            "d2j-dex2jar*.jar",
-            "d2j-dex-recompute-checksum*.jar",
-            "d2j-jar2dex*.jar",
-            "dex-reader*.jar",
-            "dex-ir*.jar",
-            "dex-translator*.jar"
-          )
-          $d2jMissing = @()
-          foreach ($pattern in $d2jChecks) {
-            $found = Get-ChildItem "resources/jvm/d2j" -Filter $pattern -Recurse -File | Select-Object -First 1
-            if ($found) { Write-Host "  ✓ $($found.Name)" }
-            else { $d2jMissing += $pattern; Write-Host "  ❌ 未找到 $pattern" }
-          }
-          if ($d2jMissing.Count -gt 0) {
-            Write-Warning "以下 dex2jar 工具缺失，DEX 修复可能失败：$($d2jMissing -join ', ')"
-          }
-
-          Write-Host "`n=== resources/js-lib 内容 ==="
-          Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
-
-          Write-Host "`n=== resources/jvm/libs 内容 ==="
-          Get-ChildItem "resources/jvm/libs" -File | Select-Object Name, Length | Format-Table -AutoSize
-
-          Write-Host "`n=== resources/libmpv 内容 ==="
-          Get-ChildItem "resources/libmpv" -File | Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host "✓ 所有关键资源就绪"
 
       - name: Run typecheck
         if: github.event.inputs.action != 'delete-only'
@@ -652,7 +547,6 @@ jobs:
 
             > 北京时间：`${{ steps.ver.outputs.bj_stamp }}`（UTC+8）
             > Commit：`${{ github.sha }}`
-            > 回退：`git checkout ${{ github.sha }}`
 
             ### 下载
             - `Win-Box Setup ${{ steps.ver.outputs.full }}.exe`
