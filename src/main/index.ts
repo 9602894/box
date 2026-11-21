@@ -30,20 +30,17 @@ import {
   checkAndUpdateSubscriptions,
 } from './LiveSubscriptionManager';
 import { importLiveFileFromPath } from './live/importLiveFile';
-// ★ 2026-11-20：直播 libmpv 服务（electron-mpv-video）
 import { createMpvMain } from 'electron-mpv-video/main';
+
 declare const __dirname: string;
 
-// ★ 声明全局变量，后续在 whenReady 里赋值
 let mpvMain: ReturnType<typeof createMpvMain> | null = null;
 
 try {
   const dir = userDataDir();
   backupUserConfig(dir);
   tryRecoverFromBackup(dir);
-} catch {
-  /* 静默 */
-}
+} catch { /* 静默 */ }
 
 let mainWindow: BrowserWindow | null = null;
 const host = new SpiderHost();
@@ -146,7 +143,6 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
-  // ★ 这里要判断 mpvMain 是否初始化成功，再 attach
   if (mpvMain) {
     try {
       mpvMain.attachWindow(mainWindow);
@@ -154,8 +150,6 @@ function createWindow(): void {
     } catch (e) {
       fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
     }
-  } else {
-    fileLogger.w('[libmpv] mpvMain 初始化失败，直播不可用');
   }
 
   const setCorner = (round: boolean) => {
@@ -190,9 +184,6 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  // ======================================================================
-  // 1. ★ 必须先设置 libmpv 运行时路径！
-  // ======================================================================
   try {
     const { resourcesDir } = await import('./util/paths');
     const mpvDir = join(resourcesDir(), 'libmpv');
@@ -206,12 +197,8 @@ app.whenReady().then(async () => {
     fileLogger.w('[libmpv] 路径探测失败: ' + (e as Error).message);
   }
 
-  // ======================================================================
-  // 2. ★ 然后再初始化 MPV 服务
-  // ======================================================================
   try {
     mpvMain = createMpvMain();
-    // 如果库支持 whenReady，最好 await 确保底层 DLL 已加载
     if (typeof (mpvMain as any).whenReady === 'function') {
       await (mpvMain as any).whenReady();
       fileLogger.i('[libmpv] MPV 服务底层就绪');
@@ -220,9 +207,6 @@ app.whenReady().then(async () => {
     fileLogger.w(`[libmpv] 服务初始化失败: ${(e as Error).message}`);
   }
 
-  // ======================================================================
-  // 3. 其他初始化逻辑
-  // ======================================================================
   try {
     const m = dataDirReport.migration;
     const migDesc = m
@@ -300,7 +284,6 @@ app.whenReady().then(async () => {
   });
   void host.quarkDeletePending().catch(() => undefined);
   
-  // 4. 创建窗口
   createWindow();
 
   setTimeout(() => {
@@ -338,7 +321,6 @@ app.on('will-quit', (event) => {
     return;
   }
   
-  // ★ 释放资源时，安全调用 mpvMain
   try { void mpvMain?.dispose(); } catch { /* ignore */ }
   try {
     void host.quarkDeletePending();
