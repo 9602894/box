@@ -35,16 +35,13 @@ import { createMpvMain } from 'electron-mpv-video/main';
 
 declare const __dirname: string;
 
-// 全局声明 mpvMain，延迟到 whenReady 后初始化
 let mpvMain: ReturnType<typeof createMpvMain> | null = null;
 
 try {
   const dir = userDataDir();
   backupUserConfig(dir);
   tryRecoverFromBackup(dir);
-} catch {
-  /* 数据目录初始化早期日志可能还没就绪，静默 */
-}
+} catch { /* 静默 */ }
 
 let mainWindow: BrowserWindow | null = null;
 const host = new SpiderHost();
@@ -147,6 +144,16 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
+  // ★ 核心修复：窗口实例化后立即注册给 MPV 服务！
+  if (mpvMain) {
+    try {
+      mpvMain.attachWindow(mainWindow);
+      fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务');
+    } catch (e) {
+      fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
+    }
+  }
+
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
   };
@@ -167,18 +174,6 @@ function createWindow(): void {
   } else {
     mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
   }
-
-  // ★ 核心修复：必须在窗口完全加载完毕后，再通知 MPV 绑定窗口
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (mpvMain && mainWindow && !mainWindow.isDestroyed()) {
-      try {
-        mpvMain.attachWindow(mainWindow);
-        fileLogger.i('[libmpv] 已成功挂载主窗口到 MPV 服务 (did-finish-load)');
-      } catch (e) {
-        fileLogger.w('[libmpv] attachWindow 失败: ' + (e as Error).message);
-      }
-    }
-  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -292,7 +287,7 @@ app.whenReady().then(async () => {
   });
   void host.quarkDeletePending().catch(() => undefined);
   
-  // 4. 创建主窗口
+  // 4. 创建主窗口（此时 mpvMain 已经就绪，挂载万无一失）
   createWindow();
 
   setTimeout(() => {
