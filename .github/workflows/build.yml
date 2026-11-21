@@ -39,7 +39,8 @@ env:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # 固定回 windows-2022，避免 windows-latest 上的 VS 18 导致 node-gyp 检测失败
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
