@@ -6,12 +6,17 @@ import { initTheme } from './lib/theme';
 import { dropSessionUiMemoryIfRestarted } from './lib/uiMemory';
 import { initMotionPref } from './lib/uiPrefs';
 import { client } from './api/client';
+// ★ 2026-11-20：注册 <mpv-video> 自定义元素（直播播放器依赖）
+import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 import './styles/global.css';
 import './styles/netflix.css';
 import './styles/bilibili.css';
 import './styles/apple.css';
 // ★ 2026-10-08（用户要求）：第四套皮肤「豆风」（Material You × 豆瓣，浅色）
 import './styles/douban.css';
+
+// ★ 新增：必须在 React 挂载之前注册，确保 LivePage 首次渲染时 <mpv-video> 已就绪
+defineMpvVideoElement();
 
 /**
  * ★ 2026-09-30（用户要求「软件关闭后，所有的墓碑机制都应该脱钩」）：
