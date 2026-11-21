@@ -1,57 +1,29 @@
 // src/renderer/pages/LivePage.tsx
-// ★ 2026-11-13（用户要求）：网络直播源更新时的精细 diff —— 不无脑重置播放。
-//   · 名字变了、URL 没变 → 只刷新 groups / 频道列表，playUrl 不动，播放继续；
-//   · 当前频道 URL 变了 → setPlayUrl(新地址)，LiveVideoPlayer 因 key 变化重挂，用新地址播；
-//   · 当前频道在新源里找不到 / 订阅源更新失败 → 保留旧 groups + 旧 playUrl，继续播。
-//   · 订阅更新后 loadLive 用 { forceRefresh: true } 绕过 5 分钟内存缓存，groups 一换 →
-//     下方 [groups] 依赖的 EPG useEffect 自动重新拉 EPG，与新源保持一致。
-//
-// ★ 2026-11-19：接入移植自修狗TV 的直播链接解析（livePlaybackProbe.ts）：
-//   容器扩展名 → 点播；.m3u8/.m3u → 只读清单探测判定点播/直播；失败静默回退直播。
-//
-// ★ 2026-11-20：直播播放器切换为 libmpv（electron-mpv-video 的 <mpv-video>）。
-//   · 点播播放器不改，本文件只管直播；
-//   · hls.js / mpegts.js 的协议分发与错误恢复不再需要，交给 libmpv；
-//   · detectPlaybackSource 仅用于 topbar 展示「点播/直播」，不参与解码决策；
-//   · 前置条件：主进程 createMpvMain().attachWindow(win)，preload exposeMpvApi()。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
 import type {
-  LiveGroup,
-  LiveBean,
-  LiveEpgEntry,
-  EpgChannelRef,
-  LiveSubscription,
+  LiveGroup, LiveBean, LiveEpgEntry, EpgChannelRef, LiveSubscription,
 } from '../../shared/types';
 import { splitLine } from '../../engine/live/LiveUtils';
 import {
-  sharedHlsPlaylistProbe,
-  containerHintForUrl,
-  isHlsProbeCandidate,
-  resolveDirectPlaybackMode,
-  type PlaybackMode,
+  sharedHlsPlaylistProbe, containerHintForUrl, isHlsProbeCandidate,
+  resolveDirectPlaybackMode, type PlaybackMode,
 } from '../live/livePlaybackProbe';
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
 
-// 注册 <mpv-video> 自定义元素（多次调用安全）
 defineMpvVideoElement();
 
-// TypeScript 不识别自定义元素，补一份最小声明
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      'mpv-video': React.DetailedHTMLProps<
-        React.HTMLAttributes<HTMLElement>,
-        HTMLElement
-      > & {
+      'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
         mode?: 'shared-texture' | 'webgl' | 'canvas2d';
       };
     }
   }
 }
 
-// ---- 频道选择记忆 ----
 const LIVE_MEM_KEY = 'winbox-live-mem';
 interface LiveMem { liveIdx?: number; groupName?: string; channelName?: string; lineIdx?: number }
 function loadLiveMem(): LiveMem {
@@ -62,19 +34,13 @@ function saveLiveMem(m: LiveMem): void {
 }
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
-
-// ★ 与 main/LiveSubscriptionManager.ts 里的 LiveSubChangedPayload 对齐
 interface LiveSubChangedPayload {
-  updated: boolean;
-  updatedIds: string[];
-  failedIds: string[];
-  reason: 'startup' | 'manual' | 'crud';
+  updated: boolean; updatedIds: string[]; failedIds: string[]; reason: 'startup' | 'manual' | 'crud';
 }
 
 type MediaKind = 'hls' | 'flv' | 'ts' | 'native' | 'unknown';
 
 class StreamDetector {
-  /** 纯 URL 判断，不联网。 */
   static detectByUrl(url: string): MediaKind {
     const lower = url.toLowerCase();
     if (lower.includes('.m3u8')) return 'hls';
@@ -85,10 +51,6 @@ class StreamDetector {
   }
 }
 
-/**
- * ★ 直播链接解析入口：仅用于 UI 展示「播放方式」。
- * libmpv 自己会按协议解码，不需要这里再决定用哪个引擎。
- */
 async function detectPlaybackSource(
   url: string,
 ): Promise<{ kind: MediaKind; mode: PlaybackMode; reason: string }> {
@@ -105,23 +67,11 @@ async function detectPlaybackSource(
   if (urlKind !== 'unknown') {
     return { kind: urlKind, mode: 'live', reason: 'default-live' };
   }
-  // 无扩展名：默认按直播起播，UI 标注 default-live
   return { kind: 'unknown', mode: 'live', reason: 'default-live' };
 }
 
-/**
- * ★ 直播播放器：libmpv（electron-mpv-video 的 <mpv-video>）。
- *
- * 与旧实现的差异：
- * - 不再按 URL 分发 hls.js / mpegts.js / 原生 video，HLS/RTMP/FLV/TS 全部由 libmpv 原生处理；
- * - 不再监听 hls.js 的 MANIFEST_PARSED / ERROR，就绪由 el.play() 的 Promise 反馈；
- * - 断流恢复交给 libmpv 内部的 stream-lavf-o（reconnect / seg_max_retry），
- *   宿主保留 doReconnect 作为兜底（点击「重新加载」或外部触发）。
- */
 function LiveVideoPlayer({
-  url,
-  onModeDetected,
-  onError,
+  url, onModeDetected, onError,
 }: {
   url: string;
   onModeDetected?: (mode: PlaybackMode, reason: string) => void;
@@ -132,23 +82,18 @@ function LiveVideoPlayer({
   useEffect(() => {
     const el = videoRef.current as any;
     if (!el || !url) return;
-
     let disposed = false;
 
     (async () => {
-      // 仅用于 UI 展示「播放方式」，不影响 libmpv 解码决策
       try {
         const { mode, reason } = await detectPlaybackSource(url);
         if (disposed) return;
         onModeDetected?.(mode, reason);
       } catch {
-        // 探测失败不阻塞起播；按直播标注
         if (!disposed) onModeDetected?.('live', 'probe-failed');
       }
-
       if (disposed) return;
       try {
-        // libmpv 原生处理 HLS / RTMP / HTTP-FLV / TS
         await el.open(url);
         if (disposed) return;
         await el.play();
@@ -167,10 +112,11 @@ function LiveVideoPlayer({
     };
   }, [url]);
 
+  // ★ 关键：Electron 33 不支持 shared-texture，必须用 webgl
   return (
     <mpv-video
       ref={videoRef as any}
-      mode="shared-texture"
+      mode="webgl"
       style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
     />
   );
@@ -190,21 +136,16 @@ export default function LivePage() {
   const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
   const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
-
   const [subCount, setSubCount] = useState(0);
   const [subEnabled, setSubEnabled] = useState(0);
-
   const [reconnectKey, setReconnectKey] = useState(0);
   const [reconnectMsg, setReconnectMsg] = useState('');
   const reconnectCountRef = useRef(0);
   const lastReconnectAtRef = useRef(0);
   const MAX_RECONNECT = 50;
-
-  // ★ 播放方式识别结果（来自 livePlaybackProbe，仅 UI 展示）
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
 
-  // ★ 把「当前播放上下文」用 ref 存一份，供订阅更新回调读取
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
   useEffect(() => {
     playStateRef.current = { liveIdx, groupName, channelName, lineIdx, playUrl };
@@ -218,7 +159,6 @@ export default function LivePage() {
     setReconnectMsg('');
   }, [playUrl]);
 
-  // ★ 兜底重连：libmpv 内部已有 stream-lavf-o 重连，这里用于「连续失败后手动重载」
   const doReconnect = useCallback(() => {
     const now = Date.now();
     if (now - lastReconnectAtRef.current < 3000) return;
@@ -247,19 +187,13 @@ export default function LivePage() {
       setLives(m);
       const idx = liveIdx < m.length ? liveIdx : 0;
       setLiveIdx(idx);
-      if (m.length && idx !== liveIdx) {
-        await loadLiveInternal(idx, m);
-      }
+      if (m.length && idx !== liveIdx) await loadLiveInternal(idx, m);
     } catch (e) {
       console.warn('[Live] reload lives 失败：', e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
-  /**
-   * ★ 加 `forceRefresh` 参数 —— 订阅源更新后调用时传 true，
-   *   绕过 SpiderHost.loadLive 的 5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。
-   */
   async function loadLiveInternal(index: number, meta?: LiveBean[], forceRefresh = false) {
     const m = meta ?? lives;
     if (!m.length) return;
@@ -281,10 +215,7 @@ export default function LivePage() {
           pickChannelInternal(group, ch.name, fromMem ? (mem.lineIdx || 0) : 0, r.groups, index);
         }
       } else {
-        setGroups([]);
-        setGroupName('');
-        setChannelName('');
-        setPlayUrl('');
+        setGroups([]); setGroupName(''); setChannelName(''); setPlayUrl('');
       }
     } catch (e) {
       setErr((e as Error).message);
@@ -346,9 +277,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /**
-   * ★ 订阅源内容有变化 → 精细 diff，不做无脑重置。
-   */
   const applySubscriptionUpdate = useCallback(async () => {
     const cur = playStateRef.current;
     try {
@@ -358,28 +286,18 @@ export default function LivePage() {
         return;
       }
       setLives(newMeta);
-
       const idx = cur.liveIdx < newMeta.length ? cur.liveIdx : 0;
       if (idx !== cur.liveIdx) setLiveIdx(idx);
-
       const r = await client.loadLive(idx, { forceRefresh: true });
       const newGroups = r.groups;
-
-      if (!cur.groupName || !cur.channelName) {
-        setGroups(newGroups);
-        return;
-      }
-
+      if (!cur.groupName || !cur.channelName) { setGroups(newGroups); return; }
       const curGroup = newGroups.find((g) => g.group === cur.groupName);
       const curChannel = curGroup?.channels.find((c) => c.name === cur.channelName);
-
       if (!curGroup || !curChannel) {
         console.info('[Live] 当前频道已从更新后的源中消失，保留旧列表与旧地址继续播放');
         return;
       }
-
       setGroups(newGroups);
-
       const newLine = splitLine(curChannel.urls[cur.lineIdx] || curChannel.urls[0], cur.lineIdx + 1);
       const newUrl = newLine.url || '';
       if (newUrl && newUrl !== cur.playUrl) {
@@ -393,28 +311,17 @@ export default function LivePage() {
     }
   }, []);
 
-  // ★ 监听主进程广播的订阅更新（带 payload），做精细 diff
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:subscriptions-changed', (payload?: LiveSubChangedPayload) => {
       void loadSubStatus();
-
-      if (!payload) {
-        void reloadLives();
-        return;
-      }
-
-      if (!payload.updated) {
-        if (payload.reason === 'crud') void reloadLives();
-        return;
-      }
-
+      if (!payload) { void reloadLives(); return; }
+      if (!payload.updated) { if (payload.reason === 'crud') void reloadLives(); return; }
       void applySubscriptionUpdate();
     });
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives, applySubscriptionUpdate]);
 
-  // ★ 监听主进程广播的「直播源已变更」→ 自动重新加载
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
@@ -425,9 +332,7 @@ export default function LivePage() {
           setLives(m);
           const idx = liveIdx < m.length ? liveIdx : 0;
           if (idx !== liveIdx) setLiveIdx(idx);
-          if (m.length) {
-            await loadLiveInternal(idx, m);
-          }
+          if (m.length) await loadLiveInternal(idx, m);
         } catch (e) {
           console.warn('[Live] live:changed 处理后失败：', e);
         }
@@ -448,12 +353,7 @@ export default function LivePage() {
     outer: for (const g of gs) {
       for (const c of g.channels) {
         if (c.name !== currentChannelName) continue;
-        const r: EpgChannelRef = {
-          tvgId: c['tvg-id'],
-          tvgName: c['tvg-name'],
-          name: c.name,
-          epg: c.epg,
-        };
+        const r: EpgChannelRef = { tvgId: c['tvg-id'], tvgName: c['tvg-name'], name: c.name, epg: c.epg };
         if (r.tvgId || r.tvgName || r.name) refs.push(r);
         break outer;
       }
@@ -465,13 +365,11 @@ export default function LivePage() {
       setEpg(r.byKey);
       setEpgStatus(Object.keys(r.byKey).length ? 'ok' : 'empty');
     } catch (e) {
-      setEpg({});
-      setEpgStatus('error');
+      setEpg({}); setEpgStatus('error');
       console.warn('[EPG] 加载失败：', e);
     }
   }
 
-  // ★ 订阅更新后 groups 一换，这里会自动用新 EPG URL 重拉 EPG
   useEffect(() => {
     if (!groups.length) return;
     void refreshEpg(liveIdx, groups, channelName);
@@ -533,7 +431,6 @@ export default function LivePage() {
         <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
           {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
         </select>
-
         <span className="status" style={{ marginLeft: 'auto' }}>
           {loading ? '加载中…' : `${groups.length} 组`}
         </span>
@@ -543,7 +440,6 @@ export default function LivePage() {
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           EPG：{epgStatusText}
         </span>
-        {/* ★ 播放方式标识：让用户知道为什么进度条能用/不能用 */}
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           播放方式：{playMode === 'vod' ? '点播' : '直播'}
           {playModeReason ? `（${playModeReason}）` : ''}
