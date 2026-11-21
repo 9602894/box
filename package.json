@@ -4,7 +4,7 @@
   "private": true,
   "description": "Win-Box-Pro (CatVod 引擎) 的 Windows 桌面移植版 — 导入源规则与安卓版保持一致",
   "type": "module",
-  "main": "dist/main.cjs",
+  "main": "dist/main.mjs",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
