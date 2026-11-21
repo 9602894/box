@@ -7,14 +7,14 @@ const root = dirname(fileURLToPath(import.meta.url));
 const src = resolve(root, '..');
 const watch = process.argv.includes('--watch');
 
-// ★ 核心补丁：让 ESM 支持 __dirname / require / __filename
+// ★ 核心补丁：让 ESM 支持 __dirname / require / __filename，并加上别名防止与业务代码冲突
 const esmBanner = `
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
-const require = createRequire(import.meta.url);
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { createRequire as __esbuild_createRequire } from "node:module";
+import { fileURLToPath as __esbuild_fileURLToPath } from "node:url";
+import { dirname as __esbuild_dirname } from "node:path";
+const require = __esbuild_createRequire(import.meta.url);
+const __filename = __esbuild_fileURLToPath(import.meta.url);
+const __dirname = __esbuild_dirname(__filename);
 `;
 
 // 主进程配置（改为 ESM 格式）
