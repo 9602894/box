@@ -11,15 +11,15 @@ import {
   resolveDirectPlaybackMode, type PlaybackMode,
 } from '../live/livePlaybackProbe';
 import { defineMpvVideoElement } from 'electron-mpv-video/renderer';
-import Hls from 'hls.js'; // ★ 引入 hls.js 用于 Web 播放器解析直播流
+import Hls from 'hls.js';
 
-// 注册 MPV 自定义元素
+// 确保在 React 挂载前注册元素
 defineMpvVideoElement();
 
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      // ★ 删除了 mode 属性的声明，防止 TS 提示和 React 强行赋值
+      // ★ 这里只声明通用的 HTMLElement 属性，不声明 mode，避免 React 强制赋值报错
       'mpv-video': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement>;
     }
   }
@@ -72,21 +72,26 @@ async function detectPlaybackSource(
 }
 
 // ----------------------------------------------------------------------
-// 播放器 1：MPV 播放器 (当前集成的)
+// 播放器 1：MPV 播放器
 // ----------------------------------------------------------------------
-function LiveVideoPlayer({
+function LiveMpvPlayer({
   url, onModeDetected, onError,
 }: {
   url: string;
   onModeDetected?: (mode: PlaybackMode, reason: string) => void;
   onError?: (msg: string) => void;
 }) {
-  const videoRef = useRef<HTMLElement>(null);
+  const [el, setEl] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
-    const el = videoRef.current as any;
     if (!el || !url) return;
     let disposed = false;
+    const mpvEl = el as any;
+
+    // ★ 通过原生 DOM API 设置属性，绕过 React 的赋值限制
+    if (typeof mpvEl.setAttribute === 'function') {
+      mpvEl.setAttribute('mode', 'webgl');
+    }
 
     (async () => {
       try {
@@ -97,38 +102,39 @@ function LiveVideoPlayer({
         if (!disposed) onModeDetected?.('live', 'probe-failed');
       }
       if (disposed) return;
+
       try {
-        await el.open(url);
+        // 部分版本可能需要等待 open 返回
+        await mpvEl.open(url);
         if (disposed) return;
-        await el.play();
+        await mpvEl.play();
       } catch (err) {
         if (!disposed) {
           console.error('[mpv] live open failed', err);
-          onError?.('直播播放失败，请尝试切换频道或线路');
+          onError?.(`MPV 播放失败: ${(err as Error).message || '请尝试切换频道或线路'}`);
         }
       }
     })();
 
     return () => {
       disposed = true;
-      try { el.stop(); } catch { /* ignore */ }
-      try { el.destroy(); } catch { /* ignore */ }
+      try { mpvEl.stop(); } catch { /* ignore */ }
+      try { mpvEl.destroy(); } catch { /* ignore */ }
     };
-  }, [url]);
+  }, [url, el, onModeDetected, onError]);
 
-  // ★ 核心修复：去掉了原本导致崩溃的 mode="webgl"
   return (
     <mpv-video
-      ref={videoRef as any}
+      ref={(node) => setEl(node)}
       style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
     />
   );
 }
 
 // ----------------------------------------------------------------------
-// 播放器 2：Web 播放器 (原生 video + hls.js)
+// 播放器 2：Web 播放器 (hls.js + 原生 video)
 // ----------------------------------------------------------------------
-function WebLivePlayer({ url }: { url: string }) {
+function LiveWebPlayer({ url, onError }: { url: string; onError?: (msg: string) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -137,36 +143,57 @@ function WebLivePlayer({ url }: { url: string }) {
 
     let hls: Hls | null = null;
 
-    // 如果是 m3u8 并且浏览器支持 MSE，使用 hls.js
+    const play = () => {
+      video.play().catch((err) => {
+        if (err.name !== 'AbortError') {
+          console.warn('[WebPlayer] 自动播放被拦截:', err);
+        }
+      });
+    };
+
     if (url.includes('.m3u8') && Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
+        backBufferLength: 90,
       });
       hls.loadSource(url);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch((e) => console.warn('WebPlayer 自动播放被拦截:', e));
+      hls.on(Hls.Events.MANIFEST_PARSED, play);
+      
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              console.warn('[WebPlayer] 网络错误，尝试恢复...');
+              hls?.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn('[WebPlayer] 媒体错误，尝试恢复...');
+              hls?.recoverMediaError();
+              break;
+            default:
+              console.error('[WebPlayer] 致命错误', data);
+              onError?.(`Web 播放失败: ${data.details}`);
+              break;
+          }
+        }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari 原生支持 m3u8
       video.src = url;
-      video.addEventListener('loadedmetadata', () => video.play().catch(() => {}));
+      video.addEventListener('loadedmetadata', play);
     } else {
-      // 其他格式直接扔给 video
       video.src = url;
-      video.play().catch((e) => console.warn('WebPlayer 播放失败:', e));
+      play();
     }
 
     return () => {
-      if (hls) {
-        hls.destroy();
-      }
+      if (hls) hls.destroy();
       video.pause();
       video.removeAttribute('src');
       video.load();
     };
-  }, [url]);
+  }, [url, onError]);
 
   return (
     <video
@@ -204,7 +231,7 @@ export default function LivePage() {
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
 
-  // ★ 新增：播放器引擎选择状态（默认 MPV）
+  // ★ 播放器引擎状态，默认 MPV，如果你发现 Web 更稳，可以在这里改成 'web'
   const [playerEngine, setPlayerEngine] = useState<'mpv' | 'web'>('mpv');
 
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
@@ -252,7 +279,6 @@ export default function LivePage() {
     } catch (e) {
       console.warn('[Live] reload lives 失败：', e);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
   async function loadLiveInternal(index: number, meta?: LiveBean[], forceRefresh = false) {
@@ -335,17 +361,13 @@ export default function LivePage() {
     })();
     void loadSubStatus();
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const applySubscriptionUpdate = useCallback(async () => {
     const cur = playStateRef.current;
     try {
       const newMeta = await client.liveMeta();
-      if (!Array.isArray(newMeta) || newMeta.length === 0) {
-        console.warn('[Live] 订阅更新后线路列表为空，保留旧列表与旧地址继续播放');
-        return;
-      }
+      if (!Array.isArray(newMeta) || newMeta.length === 0) return;
       setLives(newMeta);
       const idx = cur.liveIdx < newMeta.length ? cur.liveIdx : 0;
       if (idx !== cur.liveIdx) setLiveIdx(idx);
@@ -354,21 +376,13 @@ export default function LivePage() {
       if (!cur.groupName || !cur.channelName) { setGroups(newGroups); return; }
       const curGroup = newGroups.find((g) => g.group === cur.groupName);
       const curChannel = curGroup?.channels.find((c) => c.name === cur.channelName);
-      if (!curGroup || !curChannel) {
-        console.info('[Live] 当前频道已从更新后的源中消失，保留旧列表与旧地址继续播放');
-        return;
-      }
+      if (!curGroup || !curChannel) return;
       setGroups(newGroups);
       const newLine = splitLine(curChannel.urls[cur.lineIdx] || curChannel.urls[0], cur.lineIdx + 1);
       const newUrl = newLine.url || '';
-      if (newUrl && newUrl !== cur.playUrl) {
-        console.info('[Live] 当前频道地址已更新，使用新地址重播');
-        setPlayUrl(newUrl);
-      } else {
-        console.info('[Live] 当前频道地址未变，仅刷新频道列表');
-      }
+      if (newUrl && newUrl !== cur.playUrl) setPlayUrl(newUrl);
     } catch (e) {
-      console.warn('[Live] 处理订阅更新失败（保留旧播放继续）：', e);
+      console.warn('[Live] 处理订阅更新失败:', e);
     }
   }, []);
 
@@ -385,8 +399,7 @@ export default function LivePage() {
 
   useEffect(() => {
     const w = window as any;
-    const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
-      console.log('[Live] 收到 live:changed 广播：', payload);
+    const off = w?.winboxIpc?.on?.('live:changed', () => {
       void (async () => {
         try {
           const m = await client.liveMeta();
@@ -394,13 +407,10 @@ export default function LivePage() {
           const idx = liveIdx < m.length ? liveIdx : 0;
           if (idx !== liveIdx) setLiveIdx(idx);
           if (m.length) await loadLiveInternal(idx, m);
-        } catch (e) {
-          console.warn('[Live] live:changed 处理后失败：', e);
-        }
+        } catch { /* ignore */ }
       })();
     });
     return () => { if (typeof off === 'function') off(); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
   const curGroup = groups.find((g) => g.group === groupName);
@@ -427,14 +437,12 @@ export default function LivePage() {
       setEpgStatus(Object.keys(r.byKey).length ? 'ok' : 'empty');
     } catch (e) {
       setEpg({}); setEpgStatus('error');
-      console.warn('[EPG] 加载失败：', e);
     }
   }
 
   useEffect(() => {
     if (!groups.length) return;
     void refreshEpg(liveIdx, groups, channelName);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx, groups, channelName]);
 
   useEffect(() => {
@@ -448,43 +456,28 @@ export default function LivePage() {
     return () => {
       if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
-    const groupList = groups
-      .map((g) => ({
-        group: String(g.group || '').trim(),
-        channels: g.channels
-          .map((c) => ({
-            name: String(c.name || '').trim(),
-            tvgId: String(c['tvg-id'] || '').trim(),
-            tvgName: String(c['tvg-name'] || '').trim(),
-          }))
-          .filter((c) => !!c.name),
-      }))
-      .filter((g) => !!g.group && g.channels.length > 0);
+    const groupList = groups.map((g) => ({
+      group: String(g.group || '').trim(),
+      channels: g.channels.map((c) => ({
+        name: String(c.name || '').trim(),
+        tvgId: String(c['tvg-id'] || '').trim(),
+        tvgName: String(c['tvg-name'] || '').trim(),
+      })).filter((c) => !!c.name),
+    })).filter((g) => !!g.group && g.channels.length > 0);
     try {
       await ipcInvoke('epg:openWindow', {
-        channelName: name,
-        tvgId: (channel['tvg-id'] || '').trim(),
-        tvgName: (channel['tvg-name'] || '').trim(),
-        groups: groupList,
-        currentGroup: groupName,
+        channelName: name, tvgId: (channel['tvg-id'] || '').trim(), tvgName: (channel['tvg-name'] || '').trim(),
+        groups: groupList, currentGroup: groupName,
       });
-    } catch (e) {
-      console.warn('[EPG] 打开节目单窗口失败', e);
-    }
+    } catch (e) { /* ignore */ }
   }
 
-  const epgStatusText =
-    epgStatus === 'loading' ? '加载中…'
-      : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键`
-        : epgStatus === 'empty' ? '无节目单'
-          : epgStatus === 'error' ? '失败（看日志）'
-            : '未触发';
+  const epgStatusText = epgStatus === 'loading' ? '加载中…' : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键` : epgStatus === 'empty' ? '无节目单' : epgStatus === 'error' ? '失败' : '未触发';
 
   return (
     <>
@@ -502,16 +495,15 @@ export default function LivePage() {
           EPG：{epgStatusText}
         </span>
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          播放方式：{playMode === 'vod' ? '点播' : '直播'}
-          {playModeReason ? `（${playModeReason}）` : ''}
+          方式：{playMode === 'vod' ? '点播' : '直播'}{playModeReason ? `（${playModeReason}）` : ''}
         </span>
         
-        {/* ★ 切换播放器按钮 */}
+        {/* 播放器切换按钮 */}
         <button
           className="btn"
           style={{ marginLeft: 12, fontSize: 12, padding: '2px 8px', cursor: 'pointer' }}
           onClick={() => setPlayerEngine((p) => (p === 'mpv' ? 'web' : 'mpv'))}
-          title="切换内核：MPV 支持更多格式；Web 为原生播放器+hls.js"
+          title="切换播放器内核"
         >
           切换播放器 ({playerEngine === 'mpv' ? 'MPV' : 'Web'})
         </button>
@@ -520,14 +512,8 @@ export default function LivePage() {
       <div className="layout-2 content" style={{ padding: 12 }}>
         <div className="left">
           {groups.map((g) => (
-            <div
-              key={g.group}
-              className={`nav-item ${g.group === groupName ? 'active' : ''}`}
-              onClick={() => {
-                setGroupName(g.group);
-                if (g.channels.length) pickChannel(g, g.channels[0].name, 0, groups);
-              }}
-            >
+            <div key={g.group} className={`nav-item ${g.group === groupName ? 'active' : ''}`}
+              onClick={() => { setGroupName(g.group); if (g.channels.length) pickChannel(g, g.channels[0].name, 0, groups); }}>
               {g.group} <span className="muted">({g.channels.length})</span>
             </div>
           ))}
@@ -538,13 +524,8 @@ export default function LivePage() {
             <>
               <div className="row" style={{ marginBottom: 10, maxHeight: 180, overflow: 'auto' }}>
                 {curGroup.channels.map((c) => (
-                  <span
-                    key={c.name}
-                    className={`tag ${c.name === channelName ? 'active' : ''}`}
-                    onClick={() => pickChannel(curGroup, c.name, 0, groups)}
-                    onDoubleClick={() => openPrograms(c)}
-                    title="双击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
-                  >
+                  <span key={c.name} className={`tag ${c.name === channelName ? 'active' : ''}`}
+                    onClick={() => pickChannel(curGroup, c.name, 0, groups)} onDoubleClick={() => openPrograms(c)}>
                     {c.name}
                   </span>
                 ))}
@@ -553,37 +534,17 @@ export default function LivePage() {
                 <div className="row" style={{ marginBottom: 8 }}>
                   <span className="muted">线路：</span>
                   {lines.map((l) => (
-                    <span
-                      key={l.index}
-                      className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
-                      onClick={() => {
-                        setLineIdx(l.index - 1);
-                        setPlayUrl(l.url);
-                        saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
-                      }}
-                    >
+                    <span key={l.index} className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
+                      onClick={() => { setLineIdx(l.index - 1); setPlayUrl(l.url); saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 }); }}>
                       {l.name}
                     </span>
                   ))}
                 </div>
               )}
               {curEpg && (curEpg.current || curEpg.next) && curChannel && (
-                <div
-                  className="live-epg"
-                  onClick={() => openPrograms(curChannel)}
-                  style={{ cursor: 'pointer' }}
-                  title="点击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
-                >
-                  {curEpg.current && (
-                    <span className="live-epg-now">
-                      <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
-                    </span>
-                  )}
-                  {curEpg.next && (
-                    <span className="muted">
-                      <b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}
-                    </span>
-                  )}
+                <div className="live-epg" onClick={() => openPrograms(curChannel)} style={{ cursor: 'pointer' }}>
+                  {curEpg.current && <span className="live-epg-now"><b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}</span>}
+                  {curEpg.next && <span className="muted"><b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}</span>}
                   <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
                 </div>
               )}
@@ -591,35 +552,28 @@ export default function LivePage() {
               {playUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
                   {playbackUrl ? (
-                    // ★ 根据状态决定渲染哪个播放器
                     playerEngine === 'mpv' ? (
-                      <LiveVideoPlayer
+                      <LiveMpvPlayer
                         key={`mpv_${playbackUrl}__${reconnectKey}`}
                         url={playbackUrl}
-                        onModeDetected={(mode, reason) => {
-                          setPlayMode(mode);
-                          setPlayModeReason(reason);
-                        }}
+                        onModeDetected={(mode, reason) => { setPlayMode(mode); setPlayModeReason(reason); }}
                         onError={handlePlayerError}
                       />
                     ) : (
-                      <WebLivePlayer
+                      <LiveWebPlayer
                         key={`web_${playbackUrl}__${reconnectKey}`}
                         url={playbackUrl}
+                        onError={handlePlayerError}
                       />
                     )
                   ) : (
                     <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
                   )}
                   {reconnectMsg && (
-                    <div
-                      style={{
-                        position: 'absolute', top: 12, left: 12,
-                        padding: '6px 12px', borderRadius: 6,
-                        background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
-                        pointerEvents: 'none', zIndex: 20,
-                      }}
-                    >{reconnectMsg}</div>
+                    <div style={{
+                      position: 'absolute', top: 12, left: 12, padding: '6px 12px', borderRadius: 6,
+                      background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13, pointerEvents: 'none', zIndex: 20,
+                    }}>{reconnectMsg}</div>
                   )}
                 </div>
               ) : (
