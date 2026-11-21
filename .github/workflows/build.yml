@@ -152,7 +152,7 @@ jobs:
 
           # --- 多级回退策略，确保 mpv.lib 就位 ---
           $mpvLibDest = Join-Path $libDir "mpv.lib"
-          
+
           # 级别 1: 在包内直接查找 mpv.lib
           $existingLib = Get-ChildItem $root.FullName -Filter "mpv.lib" -Recurse | Select-Object -First 1
           if ($existingLib) {
@@ -169,21 +169,75 @@ jobs:
               if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
               Write-Host "✓ 已从 libmpv.def 生成 mpv.lib"
             } else {
-              # 级别 3: 从 mpv 官方源码仓库获取 .def 文件
-              Write-Host "⚙  [Level 3] 包内无 .def 文件，从 mpv 源码仓库获取 mpv.def..."
-              $defUrl = "https://raw.githubusercontent.com/mpv-player/mpv/master/libmpv/mpv.def"
-              $defPath = Join-Path $libDir "mpv.def"
-              try {
-                Invoke-WebRequest -Uri $defUrl -OutFile $defPath -UseBasicParsing -TimeoutSec 60
-              } catch {
-                throw "无法从 GitHub 获取 mpv.def: $($_.Exception.Message)"
+              # 级别 3: 从已下载的 libmpv-2.dll 自动生成 mpv.def
+              Write-Host "⚙  [Level 3] 包内无 .def 文件，尝试从 libmpv-2.dll 自动生成 .def..."
+              $dllPath = Join-Path $binDir "libmpv-2.dll"
+              if (Test-Path $dllPath) {
+                $defPath = Join-Path $libDir "mpv.def"
+                $exportsFile = Join-Path $env:RUNNER_TEMP "mpv-exports.txt"
+
+                # 定位 dumpbin.exe（优先 PATH，其次通过 vswhere 查 VS 安装）
+                $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+                if (-not $dumpbin) {
+                  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+                  if (Test-Path $vswhere) {
+                    $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+                    if ($vsPath) {
+                      $toolset = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+                                 Sort-Object Name -Descending | Select-Object -First 1
+                      if ($toolset) {
+                        $cand = Get-ChildItem "$($toolset.FullName)\bin\Hostx64\x64" -Filter "dumpbin.exe" -ErrorAction SilentlyContinue |
+                                Select-Object -First 1
+                        if ($cand) { $dumpbin = $cand.FullName }
+                      }
+                    }
+                  }
+                }
+
+                if ($dumpbin) {
+                  Write-Host "  使用 dumpbin: $dumpbin"
+                  & $dumpbin /exports $dllPath > $exportsFile
+                  if ($LASTEXITCODE -ne 0) { throw "dumpbin 执行失败" }
+
+                  $defContent = @("EXPORTS")
+                  Get-Content $exportsFile | ForEach-Object {
+                    if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
+                      $defContent += "    $($matches[1])"
+                    }
+                  }
+                  $defContent | Out-File -FilePath $defPath -Encoding ascii
+                  Write-Host "✓ 已从 libmpv-2.dll 生成 mpv.def（$($defContent.Count - 1) 个符号）"
+
+                  Push-Location $libDir
+                  & lib.exe /def:mpv.def /out:$mpvLibDest /machine:x64
+                  Pop-Location
+                  if (Test-Path $mpvLibDest) {
+                    Write-Host "✓ 已从自动生成的 mpv.def 生成 mpv.lib"
+                  }
+                } else {
+                  Write-Host "⚠  未找到 dumpbin，跳过从 DLL 自动生成 .def"
+                }
+              } else {
+                Write-Host "⚠  未找到 $dllPath，跳过从 DLL 自动生成 .def"
               }
-              Write-Host "✓ 已下载 mpv.def，使用 lib.exe 生成 mpv.lib..."
-              Push-Location $libDir
-              & lib.exe /def:mpv.def /out:$mpvLibDest /machine:x64
-              Pop-Location
-              if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
-              Write-Host "✓ 已从官方 mpv.def 生成 mpv.lib"
+
+              # 级别 3b: 若仍未得到 mpv.lib，回退到历史版本的 mpv.def
+              if (-not (Test-Path $mpvLibDest)) {
+                Write-Host "⚙  [Level 3b] 回退到 mpv v0.37.0 的 mpv.def..."
+                $defUrl = "https://raw.githubusercontent.com/mpv-player/mpv/v0.37.0/libmpv/mpv.def"
+                $defPath2 = Join-Path $libDir "mpv.def"
+                try {
+                  Invoke-WebRequest -Uri $defUrl -OutFile $defPath2 -UseBasicParsing -TimeoutSec 60
+                  Write-Host "✓ 已下载 mpv.def，使用 lib.exe 生成 mpv.lib..."
+                  Push-Location $libDir
+                  & lib.exe /def:mpv.def /out:$mpvLibDest /machine:x64
+                  Pop-Location
+                  if (-not (Test-Path $mpvLibDest)) { throw "lib.exe 生成 mpv.lib 失败" }
+                  Write-Host "✓ 已从 v0.37.0 mpv.def 生成 mpv.lib"
+                } catch {
+                  Write-Host "⚠  Level 3b 失败: $($_.Exception.Message)"
+                }
+              }
             }
           }
 
