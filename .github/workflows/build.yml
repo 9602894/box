@@ -39,7 +39,6 @@ env:
 
 jobs:
   build-windows:
-    # 固定回 windows-2022，避免 windows-latest 上的 VS 18 导致 node-gyp 检测失败
     runs-on: windows-2022
 
     steps:
@@ -239,10 +238,46 @@ jobs:
             exit 0
           }
           New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
-          $url = "https://github.com/zhongfly/mpv-winbuild/releases/latest/download/mpv-dev-x86_64.7z"
+
+          Write-Host "🔍 通过 GitHub API 查询 zhongfly/mpv-winbuild 最新 Release 资产..."
+          $apiUrl = "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest"
+          try {
+            $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "github-actions" } -UseBasicParsing
+          } catch {
+            throw "无法获取最新 Release 信息: $($_.Exception.Message)"
+          }
+
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Host "⚠  latest 中未找到 mpv-dev-x86_64 资产，尝试从普通版 mpv-x86_64-*.7z 中提取..."
+            $fallbackAsset = $release.assets | Where-Object { $_.name -match '^mpv-x86_64-.*\.7z$' } | Select-Object -First 1
+            if (-not $fallbackAsset) { throw "未在最新 Release 中找到任何 x86_64 7z 资产" }
+            $downloadUrl = $fallbackAsset.browser_download_url
+            $assetName   = $fallbackAsset.name
+          } else {
+            $downloadUrl = $asset.browser_download_url
+            $assetName   = $asset.name
+          }
+
+          Write-Host "⬇  下载 libmpv 运行时: $downloadUrl"
           $archive = Join-Path $env:RUNNER_TEMP "libmpv-runtime.7z"
-          Write-Host "⬇  下载 libmpv 运行时: $url"
-          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 300
+
+          $attempts = 0
+          $success  = $false
+          while ($attempts -lt 3) {
+            $attempts++
+            try {
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $archive -UseBasicParsing -TimeoutSec 300
+              $success = $true
+              break
+            } catch {
+              Write-Host "  ⚠  第 $attempts 次下载失败: $($_.Exception.Message)"
+              if ($attempts -lt 3) { Start-Sleep -Seconds 10 }
+            }
+          }
+          if (-not $success) { throw "下载失败，已重试 3 次" }
+
+          Write-Host "⚙  扁平提取 libmpv-2.dll → $mpvDir"
           & "C:\Program Files\7-Zip\7z.exe" e $archive "libmpv-2.dll" "-o$mpvDir" -y | Out-Null
           if (-not (Test-Path "$mpvDir/libmpv-2.dll")) { throw "libmpv-2.dll 未在压缩包中找到" }
           Write-Host "✓ libmpv-2.dll → $mpvDir"
